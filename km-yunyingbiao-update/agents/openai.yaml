@@ -1,0 +1,4 @@
+interface:
+  display_name: "KM运营表自动更新"
+  short_description: "按既定ERP、BI和Step2规则更新KM一部运营表"
+  default_prompt: "使用 $km-yunyingbiao-update 更新KM一部运营表，并严格保护老三表。"
