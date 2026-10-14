@@ -20,6 +20,12 @@ from openpyxl.formula.translate import Translator
 ALLOWED_GROUPS = ("KM一部一组", "KM一部二组", "KM一部三组")
 LEGACY_NAMES = ("产品表-老三(含清货淘汰)", "产品表-老三（含清货淘汰）")
 ERRORS = ("#REF!", "#VALUE!", "#N/A", "#DIV/0!", "#NAME?", "#NUM!")
+BASE_FIELDS = ("店铺别名", "主体", "运营", "备货状态")
+REQUIRED_MAIN = [
+    "店铺别名", "主体", "产品名称", "三级品类", "产品销售状态", "平台SKU",
+    "仓库SKU", "ASIN", "品类等级", "运营", "备货状态", "新品期开售月",
+    "新品期截止月", "最新新品成功率",
+] + [f"标签{i:02d}" for i in range(1, 11)]
 
 
 def clean(value):
@@ -112,6 +118,69 @@ def copy_row_style(sheet, source_row, target_row, max_col):
         sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
 
 
+def append_tracking_skus(workbook, sheet, cols, tracking, legacy_name):
+    """Apply the established new-SKU append rule and return append/exclusion counts."""
+    main_skus = set()
+    for row in range(3, sheet.max_row + 1):
+        main_skus.update(filter(None, (
+            clean(sheet.cell(row, cols[normalized("平台SKU")]).value),
+            clean(sheet.cell(row, cols[normalized("仓库SKU")]).value),
+        )))
+
+    legacy_skus = set()
+    if legacy_name:
+        legacy_cols = headers(workbook[legacy_name])
+        for key in ("平台SKU", "仓库SKU", "产品SKU"):
+            column = legacy_cols.get(normalized(key))
+            if column:
+                legacy_skus.update(
+                    clean(workbook[legacy_name].cell(row, column).value)
+                    for row in range(3, workbook[legacy_name].max_row + 1)
+                )
+
+    exclusions = main_skus | legacy_skus
+    appended = 0
+    yellow_fill = PatternFill(fill_type="solid", fgColor="FFFF00")
+    for _, source in tracking.iterrows():
+        platform_sku = clean(source["平台SKU"])
+        warehouse_sku = clean(source["SKU"])
+        launch = parse_date(source["预计开售时间"])
+        if (
+            not platform_sku
+            or platform_sku in exclusions
+            or warehouse_sku in exclusions
+            or launch is None
+            or launch < datetime(2026, 1, 1).date()
+        ):
+            continue
+        target_row = sheet.max_row + 1
+        copy_row_style(sheet, target_row - 1, target_row, 43)
+        sheet.cell(target_row, cols[normalized("平台SKU")]).value = platform_sku
+        sheet.cell(target_row, cols[normalized("仓库SKU")]).value = warehouse_sku or None
+        sheet.cell(target_row, cols[normalized("平台SKU")]).fill = yellow_fill
+        exclusions.update(filter(None, (platform_sku, warehouse_sku)))
+        appended += 1
+    return appended, len(legacy_skus)
+
+
+def platform_sales_eligible_rows(sheet, cols):
+    """Return rows selected by the original Step2 mapping condition."""
+    result = []
+    for row in range(3, sheet.max_row + 1):
+        platform_sku = clean(sheet.cell(row, cols[normalized("平台SKU")]).value)
+        warehouse_sku = clean(sheet.cell(row, cols[normalized("仓库SKU")]).value)
+        if (
+            platform_sku
+            and warehouse_sku
+            and not any(
+                clean(sheet.cell(row, cols[normalized(name)]).value)
+                for name in BASE_FIELDS
+            )
+        ):
+            result.append(row)
+    return result
+
+
 def site_rank(alias):
     text = clean(alias).upper()
     if text.endswith("-US"):
@@ -138,8 +207,8 @@ def build_parser():
     parser.add_argument("--workbook", required=True, type=Path)
     parser.add_argument("--tracking", required=True, type=Path)
     parser.add_argument("--products", required=True, type=Path)
-    parser.add_argument("--platform", required=True, type=Path)
-    parser.add_argument("--sales", required=True, type=Path)
+    parser.add_argument("--platform", type=Path)
+    parser.add_argument("--sales", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--fresh-after", required=True, type=float, help="Unix timestamp; every ERP export must be downloaded after this run start")
     return parser
@@ -147,7 +216,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    inputs = [args.workbook, args.tracking, args.products, args.platform, args.sales]
+    if bool(args.platform) != bool(args.sales):
+        raise ValueError("--platform 和 --sales 必须同时提供或同时省略")
+    inputs = [args.workbook, args.tracking, args.products] + ([args.platform, args.sales] if args.platform else [])
     if any(not path.is_file() for path in inputs):
         raise ValueError("一个或多个输入文件不存在")
     if args.output.resolve() in {path.resolve() for path in inputs}:
@@ -167,8 +238,8 @@ def main():
     products = pd.read_excel(args.products, usecols=product_fields, dtype=str).fillna("")
     product_map = products.drop_duplicates("产品SKU", keep="first").set_index("产品SKU")
     tracking_map = tracking.set_index("平台SKU")
-    platform = load_platform(args.platform)
-    sales = load_sales(args.sales)
+    platform = load_platform(args.platform) if args.platform else pd.DataFrame(columns=["主体", "平台SKU", "系统SKU", "店铺别名", "运营", "备货状态", "小组"])
+    sales = load_sales(args.sales) if args.sales else pd.DataFrame(columns=["店铺", "MSKU", "ASIN", "小组"] + [f"标签{i:02d}" for i in range(1, 11)])
 
     workbook = load_workbook(args.workbook)
     if "产品表" not in workbook.sheetnames:
@@ -179,37 +250,10 @@ def main():
 
     sheet = workbook["产品表"]
     cols = headers(sheet)
-    required_main = ["店铺别名", "主体", "产品名称", "三级品类", "产品销售状态", "平台SKU", "仓库SKU", "ASIN", "品类等级", "运营", "备货状态", "新品期开售月", "新品期截止月", "最新新品成功率"]
-    required_main += [f"标签{i:02d}" for i in range(1, 11)]
-    require(cols, required_main, "产品表")
-
-    main_skus = set()
-    for row in range(3, sheet.max_row + 1):
-        main_skus.update(filter(None, (clean(sheet.cell(row, cols[normalized("平台SKU")]).value), clean(sheet.cell(row, cols[normalized("仓库SKU")]).value))))
-    legacy_skus = set()
-    if legacy_name:
-        legacy_cols = headers(workbook[legacy_name])
-        for key in ("平台SKU", "仓库SKU", "产品SKU"):
-            column = legacy_cols.get(normalized(key))
-            if column:
-                legacy_skus.update(clean(workbook[legacy_name].cell(row, column).value) for row in range(3, workbook[legacy_name].max_row + 1))
-    exclusions = main_skus | legacy_skus
-
-    appended = 0
-    yellow_fill = PatternFill(fill_type="solid", fgColor="FFFF00")
-    for _, source in tracking.iterrows():
-        platform_sku = clean(source["平台SKU"])
-        warehouse_sku = clean(source["SKU"])
-        launch = parse_date(source["预计开售时间"])
-        if not platform_sku or platform_sku in exclusions or warehouse_sku in exclusions or launch is None or launch < datetime(2026, 1, 1).date():
-            continue
-        target_row = sheet.max_row + 1
-        copy_row_style(sheet, target_row - 1, target_row, 43)
-        sheet.cell(target_row, cols[normalized("平台SKU")]).value = platform_sku
-        sheet.cell(target_row, cols[normalized("仓库SKU")]).value = warehouse_sku or None
-        sheet.cell(target_row, cols[normalized("平台SKU")]).fill = yellow_fill
-        exclusions.update(filter(None, (platform_sku, warehouse_sku)))
-        appended += 1
+    require(cols, REQUIRED_MAIN, "产品表")
+    appended, legacy_sku_count = append_tracking_skus(
+        workbook, sheet, cols, tracking, legacy_name
+    )
 
     tracking_targets = {"新品期开售月": "预计开售时间", "新品期截止月": "新品期截止月", "最新新品成功率": "预测销量完成比例"}
     product_targets = {"产品名称": "产品名称", "三级品类": "三级品类", "产品销售状态": "产品销售状态", "品类等级": "产品实际等级"}
@@ -242,19 +286,22 @@ def main():
         if all(key) and key not in sales_map:
             sales_map[key] = {"ASIN": clean(source["ASIN"]), **{f"标签{i:02d}": clean(source[f"标签{i:02d}"]) for i in range(1, 11)}}
 
-    step2_eligible = step2_platform = step2_sales = 0
-    base_fields = ("店铺别名", "主体", "运营", "备货状态")
-    for row in range(3, sheet.max_row + 1):
+    eligible_rows = platform_sales_eligible_rows(sheet, cols)
+    if not args.platform and eligible_rows:
+        raise ValueError(
+            "旧 Step2 逻辑检测到需要补充平台 SKU 映射的行，"
+            "必须同时提供 --platform 和 --sales"
+        )
+
+    step2_eligible = len(eligible_rows)
+    step2_platform = step2_sales = 0
+    for row in eligible_rows:
         platform_sku = clean(sheet.cell(row, cols[normalized("平台SKU")]).value)
-        warehouse_sku = clean(sheet.cell(row, cols[normalized("仓库SKU")]).value)
-        if not platform_sku or not warehouse_sku or any(clean(sheet.cell(row, cols[normalized(name)]).value) for name in base_fields):
-            continue
-        step2_eligible += 1
         source = platform_map.get(platform_sku)
         if not source:
             continue
         step2_platform += 1
-        for name in base_fields:
+        for name in BASE_FIELDS:
             sheet.cell(row, cols[normalized(name)]).value = source[name] or None
         sale = sales_map.get((source["店铺别名"], platform_sku))
         if sale:
@@ -275,8 +322,9 @@ def main():
 
     replace_sheet(workbook, "ERP新品成功率", tracking)
     replace_sheet(workbook, "ERP产品档案", products)
-    replace_sheet(workbook, "Step2平台SKU映射", platform)
-    replace_sheet(workbook, "Step2亚马逊销售面板", sales)
+    if args.platform:
+        replace_sheet(workbook, "Step2平台SKU映射", platform)
+        replace_sheet(workbook, "Step2亚马逊销售面板", sales)
 
     legacy_after = sheet_digest(workbook[legacy_name]) if legacy_name else None
     if legacy_name and legacy_before != legacy_after:
@@ -300,11 +348,12 @@ def main():
         "trackingMatches": tracking_matches,
         "productMatches": product_matches,
         "newSkuAppended": appended,
-        "legacySkuExclusions": len(legacy_skus),
+        "legacySkuExclusions": legacy_sku_count,
         "legacySheetPresent": bool(legacy_name),
         "step2Eligible": step2_eligible,
         "step2PlatformMatches": step2_platform,
         "step2SalesMatches": step2_sales,
+        "platformSalesSourcesRefreshed": bool(args.platform),
         "borderedRows": bordered,
         "legacySheetUnchanged": True if legacy_name else None,
         "preexistingFormulaErrors": len(preexisting_errors),

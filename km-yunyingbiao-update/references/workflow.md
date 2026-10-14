@@ -8,7 +8,9 @@ Open `https://erp.issyzone.net:9999/system/index`. If a DingTalk QR login is sho
 Every refresh run must use a new user-authenticated session and newly generated exports. Do not reuse an older export when the user requested the latest data.
 Record `run_start` before opening ERP. The ERP processor must receive `--fresh-after run_start` and reject any tracking, product, platform, or sales export whose filesystem timestamp is older than that value.
 
-For a complete Step2 run, use `--kind tracking-products` so 新品成功率 and 产品档案 are exported in one browser context after one DingTalk scan. Use the individual `tracking` or `products` modes only for a deliberately isolated report test or refresh.
+For a complete Step2 run, use `--kind step2-all` so 新品成功率、产品档案、平台 SKU 映射 and 亚马逊销售面板 are exported in one browser context after one DingTalk scan. Use `tracking`, `products`, `tracking-products`, `platform`, or `sales` only for a deliberately isolated report test or refresh.
+
+Pass `--workbook <current operations workbook>` during a complete run. The runner preserves the original Step2 eligibility rule and only automates its source acquisition. After applying the established tracking append rule in memory, it checks for rows where `平台SKU` and `仓库SKU` are both present while `店铺别名`, `主体`, `运营`, and `备货状态` are all blank. If none exist, it skips both platform/sales exports. If any exist, both sources must be freshly downloaded in the current ERP session. Do not replace this condition with a count of tracking rows or introduce a new business rule.
 
 ## 2. Export新品成功率跟踪表
 
@@ -34,7 +36,27 @@ Before matching, keep only these主体 values: `KM一部一组`, `KM一部二组
 
 Use the newest download timestamp and export-record creation time together. Do not assume the visible filename is unique. Move or copy the verified files to a runtime staging directory outside the Skill source tree; never commit business exports to the Skill repository.
 
-## 4. 新品成功率表 matching
+## 4. Export平台 SKU 映射
+
+Run this export only when the original Step2 condition reports one or more rows requiring platform-SKU mapping.
+
+1. Open `运营 -> 我的平台SKU`.
+2. Click `重置`.
+3. In `主体`, select exactly `KM一部一组`, `KM一部二组`, and `KM一部三组`, then verify all three checkbox states.
+4. Click `搜索`.
+5. Click `导出 -> 导出（运营）`. If the current ERP page shows a confirmation dialog, click its `确认` or `确定` button. Capture the resulting direct download as `映射-备货信息-运营.xlsx`.
+
+## 5. Export亚马逊销售面板
+
+Run this export together with the platform mapping export when the original Step2 condition requires mapping.
+
+1. Open `销售 -> Amazon销售面板`.
+2. In `小组`, select exactly the same three KM groups and verify all three checkbox states.
+3. Click `搜索 -> 导出`.
+4. Open `常用操作 -> 导出记录`, reload the inner records page while waiting, and select only the current-run Amazon sales-panel row.
+5. Wait until `生成状态` is `已完成`, then click that row's `下载` and save it as `亚马逊销售面板.xlsx`. The export normally takes about five minutes; do not use an older completed row.
+
+## 6. 新品成功率表 matching
 
 Use `平台SKU` as the unique key in both the source and operation table.
 
@@ -60,7 +82,7 @@ Add a source row only when all conditions hold:
 
 Do not add blank, unparseable, 2024, or 2025 dates. Append eligible rows contiguously. Populate the source `平台SKU` and `仓库SKU` fields according to the established operation-table layout. Mark only the new `平台SKU` cell yellow.
 
-## 5. 产品档案 matching
+## 7. 产品档案 matching
 
 Use:
 
@@ -86,13 +108,13 @@ python "$skillRoot\scripts\add_product_archive_sheet.py" `
   --fresh-after <run_start_unix_timestamp>
 ```
 
-## 6. Source tabs and repeated runs
+## 8. Source tabs and repeated runs
 
 - Add one source tab for the filtered新品成功率 export and one for the complete产品档案 export.
 - On a repeated run, replace the prior generated tab with the same logical name rather than creating `产品档案1`, `产品档案2`, or equivalent duplicates.
 - Keep the original downloaded files in the runtime staging directory for traceability; do not place business exports under version control.
 
-## 7. Validation before saving
+## 9. Validation before saving
 
 Report at least:
 
@@ -125,4 +147,8 @@ Run once without `--output` first to validate freshness, exact filters, required
 
 ## Automation boundary
 
-This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind tracking` and `--kind products` for the two ERP exports, then run `scripts/update_erp_step2.py` after the BI step. Fully unattended execution is not appropriate because DingTalk scanning is a user-authentication step and Chrome may require a user-visible download permission confirmation.
+This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind step2-all --workbook <current-operations-workbook> --download-dir <new-empty-directory>` once. The script uses the fixed menu paths for `我的平台SKU` and `Amazon销售面板` only when the original Step2 condition requires those sources. It captures a direct download when available and otherwise follows only an export-record row created by the current run. It saves those reports as `映射-备货信息-运营.xlsx` and `亚马逊销售面板.xlsx`.
+
+Before running the workbook processor, execute `scripts/validate_erp_step2_exports.py` with all four export paths and the recorded `run_start`. The validator rejects stale files, wrong tracking brand or subjects, missing source sheets, and missing required fields. Platform and sales exports may contain other groups because the processor filters their `小组` column to the three exact KM groups.
+
+Fully unattended execution is not appropriate because DingTalk scanning is a user-authentication step and Chrome may require a user-visible download permission confirmation.

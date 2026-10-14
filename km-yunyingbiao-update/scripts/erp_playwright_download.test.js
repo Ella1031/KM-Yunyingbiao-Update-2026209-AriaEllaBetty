@@ -2,12 +2,18 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { loadPlaywright } = require('./playwright_runtime');
 const { chromium } = loadPlaywright();
 const {
+  REPORTS,
   clearOtherCheckedSubjectOptions,
+  downloadGenericReport,
   ensureCheckboxOption,
+  isFreshExportRecord,
   isFreshProductRecord,
+  openReportFromMenuSearch,
   recordTimestamp,
   selectedReportKinds,
   selectSingleOption,
@@ -93,10 +99,60 @@ async function main() {
   assert.ok((await page.locator('[data-name="rerendered"]').getAttribute('class')).includes('is-checked'));
   assert.ok((await page.locator('[data-name="third"]').getAttribute('class')).includes('is-checked'));
 
+  await page.setContent(`
+    <input placeholder="输入并选择一个菜单" oninput="document.querySelector('#menu-result').hidden=false">
+    <div id="menu-result" hidden>
+      <div role="option" onclick="document.querySelector('#platform-report').hidden=false; this.parentElement.hidden=true">我的平台SKU</div>
+    </div>
+    <section id="platform-report" hidden>
+      <h1>我的平台SKU</h1>
+      <button>导出备货信息(取数)</button>
+    </section>
+  `);
+  const platformSurface = await openReportFromMenuSearch(page, REPORTS.platform);
+  assert.strictEqual(platformSurface.owner, page);
+  assert.ok((await platformSurface.frame.locator('body').innerText()).includes('导出备货信息(取数)'));
+
+  await page.setContent(`
+    <input placeholder="输入并选择一个菜单" oninput="document.querySelector('#sales-menu').hidden=false">
+    <div id="sales-menu" hidden>
+      <div role="option" onclick="document.querySelector('#sales-report').hidden=false; this.parentElement.hidden=true">亚马逊销售面板</div>
+    </div>
+    <section id="sales-report" hidden>
+      <h1>亚马逊销售面板</h1>
+      <button>重置</button>
+      <input placeholder="小组" role="combobox" aria-controls="sales-groups" aria-expanded="true">
+      <div id="sales-groups" class="el-popper">
+        <label class="el-checkbox"><input type="checkbox"><span>KM一部一组</span></label>
+        <label class="el-checkbox"><input type="checkbox"><span>KM一部二组</span></label>
+        <label class="el-checkbox"><input type="checkbox"><span>KM一部三组</span></label>
+      </div>
+      <button>搜索</button>
+      <a download="raw-sales.xlsx" href="data:application/octet-stream;base64,dGVzdCB3b3JrYm9vaw==">导出Excel</a>
+      <span>导出</span>
+    </section>
+  `);
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'erp-step2-download-test-'));
+  const salesMenuPath = REPORTS.sales.menuPath;
+  const salesExportTexts = REPORTS.sales.exportTexts;
+  try {
+    REPORTS.sales.menuPath = null;
+    REPORTS.sales.exportTexts = ['导出Excel'];
+    const salesPath = await downloadGenericReport(page.context(), page, downloadDir, 'sales');
+    assert.strictEqual(path.basename(salesPath), '亚马逊销售面板.xlsx');
+    assert.ok(fs.statSync(salesPath).size > 0);
+  } finally {
+    REPORTS.sales.menuPath = salesMenuPath;
+    REPORTS.sales.exportTexts = salesExportTexts;
+    fs.rmSync(downloadDir, { recursive: true, force: true });
+  }
+
   await browser.close();
 assert.ok(recordTimestamp('2026-10-13 14:44:52') > 0);
 assert.strictEqual(recordTimestamp('no timestamp'), null);
 assert.deepStrictEqual(selectedReportKinds('tracking-products'), ['tracking', 'products']);
+assert.deepStrictEqual(selectedReportKinds('platform-sales'), ['platform', 'sales']);
+assert.deepStrictEqual(selectedReportKinds('step2-all'), ['tracking', 'products', 'platform', 'sales']);
 assert.deepStrictEqual(selectedReportKinds('tracking'), ['tracking']);
 assert.throws(() => selectedReportKinds('all'), /tracking-products/);
 const exportedAt = new Date(2026, 9, 13, 14, 58, 4).getTime();
@@ -107,6 +163,22 @@ assert.strictEqual(
 assert.strictEqual(
   isFreshProductRecord('product_export_excel_plus_for_name 2026-10-13 14:44:52 已完成', exportedAt),
   false,
+);
+assert.strictEqual(
+  isFreshExportRecord('replenishmentInfo 导出备货信息(取数) 2026-10-13 14:58:05 已完成', exportedAt, ['replenishmentInfo']),
+  true,
+);
+assert.strictEqual(
+  isFreshExportRecord('replenishmentInfo 导出备货信息(取数) 2026-10-13 14:44:52 已完成', exportedAt, ['replenishmentInfo']),
+  false,
+);
+assert.strictEqual(
+  isFreshExportRecord('other_report 2026-10-13 14:58:05 已完成', exportedAt, ['replenishmentInfo']),
+  false,
+);
+assert.strictEqual(
+  isFreshExportRecord('亚马逊销售面板 2026-10-13 14:58:05 运算中', exportedAt, ['亚马逊销售面板', 'amazon_sales']),
+  true,
 );
 
 console.log('ERP selector self-test passed.');

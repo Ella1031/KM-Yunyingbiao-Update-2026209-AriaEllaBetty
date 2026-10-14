@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const { spawnSync } = require('child_process');
 const { loadPlaywright } = require('./playwright_runtime');
 const { chromium } = loadPlaywright();
 
@@ -24,6 +25,26 @@ const REPORTS = {
     filePrefix: '产品档案',
     instructions: '请打开“产品模块 -> 产品档案”，筛选品牌 Kemimoto，并确认导出选项为“导出（包括产品名称）”。',
   },
+  platform: {
+    name: '我的平台SKU',
+    menuPath: ['运营', '我的平台SKU'],
+    menuNames: ['我的平台SKU'],
+    filterLabel: '主体',
+    exportTexts: ['导出（运营）', '导出(运营)', '导出'],
+    recordTerms: ['replenishmentInfo', '导出备货信息', '映射-备货信息-运营'],
+    outputName: '映射-备货信息-运营.xlsx',
+    pageTerms: ['主体', '搜索', '导出'],
+  },
+  sales: {
+    name: '亚马逊销售面板',
+    menuPath: ['销售', 'Amazon销售面板'],
+    menuNames: ['Amazon销售面板', '亚马逊销售面板', 'MSKU销售面板'],
+    filterLabel: '小组',
+    exportTexts: ['导出'],
+    recordTerms: ['Amazon销售面板', '亚马逊销售面板', 'MSKU销售面板', 'amazon_sales'],
+    outputName: '亚马逊销售面板.xlsx',
+    pageTerms: ['小组', '搜索', '导出'],
+  },
 };
 
 function arg(name, fallback) {
@@ -33,8 +54,10 @@ function arg(name, fallback) {
 
 function selectedReportKinds(kind) {
   if (kind === 'tracking-products') return ['tracking', 'products'];
+  if (kind === 'platform-sales') return ['platform', 'sales'];
+  if (kind === 'step2-all') return ['tracking', 'products', 'platform', 'sales'];
   if (REPORTS[kind]) return [kind];
-  throw new Error('--kind 必须是 tracking、products 或 tracking-products');
+  throw new Error('--kind 必须是 tracking、products、tracking-products、platform、sales、platform-sales 或 step2-all');
 }
 
 function chromePath() {
@@ -77,12 +100,12 @@ async function clickTextAnyFrame(page, text) {
   for (const frame of page.frames()) {
     const exact = frame.getByText(text, { exact: true }).first();
     if (await exact.count() && await exact.isVisible().catch(() => false)) {
-      await exact.click().catch(() => exact.evaluate((node) => node.click()));
+      await exact.click({ noWaitAfter: true }).catch(() => exact.evaluate((node) => node.click()));
       return true;
     }
     const partial = frame.getByText(text, { exact: false }).first();
     if (await partial.count() && await partial.isVisible().catch(() => false)) {
-      await partial.click().catch(() => partial.evaluate((node) => node.click()));
+      await partial.click({ noWaitAfter: true }).catch(() => partial.evaluate((node) => node.click()));
       return true;
     }
     if (await partial.count()) {
@@ -91,6 +114,146 @@ async function clickTextAnyFrame(page, text) {
     }
   }
   return false;
+}
+
+async function visibleExactTextInContext(context, texts) {
+  for (const owner of context.pages()) {
+    for (const frame of owner.frames()) {
+      for (const text of texts) {
+        const match = await firstVisible(frame.getByText(text, { exact: true }));
+        if (match) return { owner, frame, locator: match, text };
+      }
+    }
+  }
+  return null;
+}
+
+async function visibleNormalizedButtonInContext(context, texts, timeoutMs = 5000) {
+  const expected = new Set(texts.map((text) => text.replace(/\s+/g, '')));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const owner of context.pages()) {
+      for (const frame of owner.frames()) {
+        const buttons = frame.locator('button, [role="button"], .el-button');
+        const count = await buttons.count();
+        for (let i = 0; i < count; i += 1) {
+          const button = buttons.nth(i);
+          if (!await button.isVisible().catch(() => false)) continue;
+          const text = (await button.innerText().catch(() => '')).replace(/\s+/g, '');
+          if (expected.has(text)) return { owner, frame, locator: button, text };
+        }
+      }
+    }
+    await shellPageDelay(context, 250);
+  }
+  return null;
+}
+
+async function findMenuSearch(shellPage) {
+  for (const frame of shellPage.frames()) {
+    const selectors = [
+      'input[placeholder*="输入并选择一个菜单"]',
+      'input[placeholder*="选择一个菜单"]',
+      '[role="combobox"][placeholder*="菜单"]',
+      '[contenteditable="true"][data-placeholder*="菜单"]',
+    ];
+    for (const selector of selectors) {
+      const input = await firstVisible(frame.locator(selector));
+      if (input) return { frame, input };
+    }
+  }
+  return null;
+}
+
+async function waitForReportSurface(context, config, timeoutMs = 60000, requireName = true) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const owner of context.pages()) {
+      for (const frame of owner.frames()) {
+        const body = await frame.locator('body').innerText().catch(() => '');
+        const named = config.menuNames.some((name) => body.includes(name));
+        const actionable = config.pageTerms.some((term) => body.includes(term))
+          || config.exportTexts.some((term) => body.includes(term));
+        if ((!requireName || named) && actionable) return { owner, frame };
+      }
+    }
+    await shellPageDelay(context, 500);
+  }
+  return null;
+}
+
+async function shellPageDelay(context, delayMs) {
+  const page = context.pages()[0];
+  if (page) await page.waitForTimeout(delayMs);
+}
+
+async function openReportFromMenuSearch(shellPage, config) {
+  const context = shellPage.context();
+  let search = await findMenuSearch(shellPage);
+  if (!search) {
+    await shellPage.goto(ERP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await shellPage.waitForTimeout(5000);
+    search = await findMenuSearch(shellPage);
+  }
+  if (!search) throw new Error(`ERP 顶部未找到菜单搜索框，无法打开“${config.name}”。`);
+
+  for (const query of config.menuNames) {
+    await search.input.fill('').catch(() => {});
+    await search.input.fill(query).catch(async () => {
+      await search.input.click();
+      await shellPage.keyboard.press('Control+A');
+      await shellPage.keyboard.type(query);
+    });
+    await search.frame.waitForTimeout(800);
+    const candidate = await visibleExactTextInContext(context, config.menuNames);
+    if (!candidate) continue;
+    await candidate.locator.click().catch(() => candidate.locator.evaluate((node) => node.click()));
+    const surface = await waitForReportSurface(context, config, 30000);
+    if (surface) {
+      console.log(JSON.stringify({
+        stage: 'report-opened',
+        kind: config.name,
+        selectedMenu: candidate.text,
+        pageUrl: surface.owner.url(),
+        frameUrl: surface.frame.url(),
+      }, null, 2));
+      return surface;
+    }
+  }
+
+  const suggestions = [];
+  for (const frame of shellPage.frames()) {
+    suggestions.push(...await frame.locator('[role="option"], .el-autocomplete-suggestion li, .el-select-dropdown__item')
+      .allTextContents().catch(() => []));
+  }
+  throw new Error(`菜单搜索未能打开“${config.name}”。候选项：${suggestions.slice(0, 60).join(' / ')}`);
+}
+
+async function openReportFromMenuPath(shellPage, config) {
+  const context = shellPage.context();
+  await shellPage.goto(ERP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await shellPage.waitForTimeout(4000);
+  for (const item of config.menuPath) {
+    if (!await clickTextAnyFrame(shellPage, item)) {
+      throw new Error(`ERP 菜单路径未找到“${item}”（${config.menuPath.join(' -> ')}）。`);
+    }
+    await shellPage.waitForTimeout(1000);
+  }
+  const surface = await waitForReportSurface(context, config, 30000, false);
+  if (!surface) throw new Error(`已点击菜单 ${config.menuPath.join(' -> ')}，但报表页面未加载。`);
+  console.log(JSON.stringify({
+    stage: 'report-opened',
+    kind: config.name,
+    menuPath: config.menuPath,
+    pageUrl: surface.owner.url(),
+    frameUrl: surface.frame.url(),
+  }, null, 2));
+  return surface;
+}
+
+async function openConfiguredReport(shellPage, config) {
+  if (config.menuPath) return openReportFromMenuPath(shellPage, config);
+  return openReportFromMenuSearch(shellPage, config);
 }
 
 async function firstVisible(locator) {
@@ -302,7 +465,7 @@ async function clickProductExport(frame) {
     const buttons = await frame.locator('button, [role="button"], a').allTextContents().catch(() => []);
     throw new Error(`产品档案页面未找到“导出（包括产品名称）”。可见操作：${buttons.slice(0, 80).join(' / ')}；页面：${body.slice(0, 1200)}`);
   }
-  await exportOption.click().catch(() => exportOption.evaluate((node) => node.click()));
+  await exportOption.click({ noWaitAfter: true }).catch(() => exportOption.evaluate((node) => node.click()));
 }
 
 async function openExportRecords(shellPage) {
@@ -367,15 +530,17 @@ function recordTimestamp(text) {
   ).getTime();
 }
 
-function isFreshProductRecord(text, exportedAt) {
+function isFreshExportRecord(text, exportedAt, terms) {
   const timestamp = recordTimestamp(text);
-  const named = text.includes('product_export_excel_plus_for_name')
-    || text.includes('产品档案')
-    || text.includes('包括产品名称');
+  const named = terms.some((term) => text.includes(term));
   return named && timestamp != null && timestamp >= exportedAt - 120000;
 }
 
-async function waitForProductExportDownload(recordOwner, recordFrame, exportedAt) {
+function isFreshProductRecord(text, exportedAt) {
+  return isFreshExportRecord(text, exportedAt, ['product_export_excel_plus_for_name', '产品档案', '包括产品名称']);
+}
+
+async function waitForExportRecordDownload(recordOwner, recordFrame, exportedAt, { label, recordTerms }) {
   const deadline = Date.now() + 1200000;
   let lastDiagnosticAt = 0;
   while (Date.now() < deadline) {
@@ -387,7 +552,7 @@ async function waitForProductExportDownload(recordOwner, recordFrame, exportedAt
       const text = (await row.innerText().catch(() => '')).trim();
       if (!text) continue;
       const timestamp = recordTimestamp(text);
-      if (!isFreshProductRecord(text, exportedAt)) continue;
+      if (!isFreshExportRecord(text, exportedAt, recordTerms)) continue;
       candidates.push({ row, text, timestamp });
     }
     candidates.sort((left, right) => (right.timestamp || 0) - (left.timestamp || 0));
@@ -422,14 +587,21 @@ async function waitForProductExportDownload(recordOwner, recordFrame, exportedAt
     });
     await recordOwner.waitForTimeout(3000);
   }
-  throw new Error('等待产品档案导出记录完成超过 20 分钟。');
+  throw new Error(`等待${label}导出记录完成超过 20 分钟。`);
+}
+
+async function waitForProductExportDownload(recordOwner, recordFrame, exportedAt) {
+  return waitForExportRecordDownload(recordOwner, recordFrame, exportedAt, {
+    label: '产品档案',
+    recordTerms: ['product_export_excel_plus_for_name', '产品档案', '包括产品名称'],
+  });
 }
 
 async function openFilterSelect(frame, { placeholders, values = [] }) {
   for (const placeholder of placeholders) {
     const input = await firstVisible(frame.locator(`input[placeholder*="${placeholder}"]`));
     if (input) {
-      await input.click();
+      await input.click({ force: true });
       return input;
     }
     const text = await firstVisible(frame.getByText(placeholder, { exact: true }));
@@ -438,7 +610,7 @@ async function openFilterSelect(frame, { placeholders, values = [] }) {
       if (await select.count() && await select.isVisible().catch(() => false)) {
         const combobox = select.locator('input[role="combobox"]').first();
         if (await combobox.count()) {
-          await combobox.click();
+          await combobox.click({ force: true });
           return combobox;
         }
         await select.click({ force: true });
@@ -449,14 +621,14 @@ async function openFilterSelect(frame, { placeholders, values = [] }) {
   for (const value of values) {
     const input = await firstVisible(frame.locator(`input[value="${value}"]`));
     if (input) {
-      await input.click();
+      await input.click({ force: true });
       return input;
     }
     const text = await firstVisible(frame.getByText(value, { exact: true }));
     if (text) {
       const select = text.locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " el-select ") or contains(concat(" ", normalize-space(@class), " "), " el-cascader ")][1]');
       const combobox = select.locator('input[role="combobox"]').first();
-      if (await combobox.count()) await combobox.click();
+      if (await combobox.count()) await combobox.click({ force: true });
       else if (await select.count()) await select.click({ force: true });
       else await text.click();
       return await combobox.count() ? combobox : text;
@@ -653,12 +825,12 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
 
     const dimension = await firstVisible(frame.getByText('平台SKU维度', { exact: true }));
     if (!dimension) throw new Error('未找到“平台SKU维度”。');
-    await dimension.click();
+    await dimension.click({ noWaitAfter: true });
     done.push('平台SKU维度');
 
     const expand = await firstVisible(frame.getByText('展开', { exact: true }));
     if (expand) {
-      await expand.click();
+      await expand.click({ noWaitAfter: true });
       await frame.waitForTimeout(500);
     }
     done.push('展开');
@@ -690,7 +862,7 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
 
     const search = await firstVisible(frame.getByText('搜索', { exact: true }));
     if (!search) throw new Error('筛选完成，但未找到“搜索”按钮。');
-    await search.click();
+    await search.click({ noWaitAfter: true });
     await page.waitForTimeout(2500);
     done.push('搜索');
   } else if (kind === 'products') {
@@ -699,10 +871,13 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
   return done;
 }
 
-async function saveDownload(download, outputDir, exportedAt, kind) {
+async function saveDownload(download, outputDir, exportedAt, kind, outputName = null) {
   const filename = download.suggestedFilename();
-  let target = path.join(outputDir, filename);
-  if (fs.existsSync(target)) {
+  let target = path.join(outputDir, outputName || filename);
+  if (outputName && fs.existsSync(target)) {
+    throw new Error(`下载目录已存在 ${outputName}，请使用新的运行目录，避免混入旧导出。`);
+  }
+  if (!outputName && fs.existsSync(target)) {
     const extension = path.extname(filename);
     target = path.join(outputDir, `${path.basename(filename, extension)}-${Date.now()}${extension}`);
   }
@@ -711,6 +886,102 @@ async function saveDownload(download, outputDir, exportedAt, kind) {
   if (saved.mtimeMs < exportedAt - 2000) throw new Error(`下载文件时间早于本次导出：${target}`);
   console.log(JSON.stringify({ stage: 'downloaded', kind, path: target, suggestedFilename: filename }, null, 2));
   return target;
+}
+
+async function clickConfiguredExport(context, config) {
+  const specificTexts = config.exportTexts.filter((text) => text !== '导出');
+  let action = await visibleExactTextInContext(context, specificTexts);
+  if (action) {
+    await action.locator.click({ noWaitAfter: true }).catch(() => action.locator.evaluate((node) => node.click()));
+    return action.text;
+  }
+
+  const trigger = await visibleExactTextInContext(context, ['导出']);
+  if (!trigger) throw new Error(`${config.name} 页面未找到导出操作。`);
+  await trigger.locator.click({ noWaitAfter: true }).catch(() => trigger.locator.evaluate((node) => node.click()));
+  await trigger.owner.waitForTimeout(600);
+  action = await visibleExactTextInContext(context, specificTexts);
+  if (action) {
+    await action.locator.click({ noWaitAfter: true }).catch(() => action.locator.evaluate((node) => node.click()));
+    return `${trigger.text} -> ${action.text}`;
+  }
+  return trigger.text;
+}
+
+async function applyGenericGroupFilter(surface, config) {
+  const frame = surface.frame;
+  const reset = await firstVisible(frame.getByText('重置', { exact: true }));
+  if (reset) {
+    await reset.click({ noWaitAfter: true }).catch(() => reset.evaluate((node) => node.click()));
+    await frame.waitForTimeout(500);
+  }
+
+  const groupSelect = await openFilterSelect(frame, {
+    placeholders: [config.filterLabel],
+    values: ['KM一部'],
+  });
+  if (!groupSelect) {
+    console.log(JSON.stringify({
+      stage: 'group-control-diagnostic',
+      kind: config.name,
+      label: config.filterLabel,
+      ...(await filterControlDiagnostic(frame)),
+    }, null, 2));
+    throw new Error(`${config.name} 未找到“${config.filterLabel}”筛选框。`);
+  }
+  await groupSelect.fill('KM一部').catch(() => {});
+  await ensureComboboxOpen(groupSelect);
+  await frame.waitForTimeout(300);
+  const requiredGroups = ['KM一部一组', 'KM一部二组', 'KM一部三组'];
+  await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
+  for (const group of requiredGroups) await ensureCheckboxOption(frame, [group], groupSelect);
+  await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
+  await verifyCheckboxOptions(frame, requiredGroups, groupSelect);
+  await surface.owner.keyboard.press('Escape').catch(() => {});
+
+  const search = await firstVisible(frame.getByText('搜索', { exact: true }));
+  if (!search) throw new Error(`${config.name} 筛选完成，但未找到“搜索”按钮。`);
+  await search.click({ noWaitAfter: true }).catch(() => search.evaluate((node) => node.click()));
+  await frame.waitForTimeout(2500);
+  console.log(JSON.stringify({
+    stage: 'filters',
+    kind: config.name,
+    reset: Boolean(reset),
+    field: config.filterLabel,
+    groups: requiredGroups,
+  }, null, 2));
+}
+
+async function downloadGenericReport(context, shellPage, outputDir, kind) {
+  const config = REPORTS[kind];
+  const surface = await openConfiguredReport(shellPage, config);
+  await applyGenericGroupFilter(surface, config);
+  const exportedAt = Date.now();
+  const downloadOwners = [...new Set([surface.owner, ...context.pages()])];
+  const directPromises = downloadOwners.map((owner) => owner.waitForEvent('download', { timeout: 12000 }).catch(() => null));
+  const action = await clickConfiguredExport(context, config);
+  let download = await Promise.race([
+    ...directPromises,
+    surface.owner.waitForTimeout(3000).then(() => null),
+  ]);
+  if (kind === 'platform' && !download) {
+    const confirm = await visibleNormalizedButtonInContext(context, ['确认', '确定'], 8000);
+    if (confirm) {
+      await confirm.locator.click({ noWaitAfter: true }).catch(() => confirm.locator.evaluate((node) => node.click()));
+    } else {
+      console.log(JSON.stringify({ stage: 'export-confirm-not-shown', kind, action }, null, 2));
+    }
+  }
+  download = download || (await Promise.all(directPromises)).find(Boolean) || null;
+  if (!download) {
+    const records = await openExportRecords(shellPage);
+    download = await waitForExportRecordDownload(records.owner, records.frame, exportedAt, {
+      label: config.name,
+      recordTerms: config.recordTerms,
+    });
+  }
+  console.log(JSON.stringify({ stage: 'export-submitted', kind, action }, null, 2));
+  return saveDownload(download, outputDir, exportedAt, kind, config.outputName);
 }
 
 async function downloadTracking(context, outputDir) {
@@ -735,7 +1006,7 @@ async function downloadTracking(context, outputDir) {
   }
   const exportedAt = Date.now();
   const downloadPromise = page.waitForEvent('download', { timeout: 180000 });
-  await exportButton.click();
+  await exportButton.click({ noWaitAfter: true });
   const download = await downloadPromise;
   const target = await saveDownload(download, outputDir, exportedAt, kind);
   await page.close();
@@ -763,10 +1034,50 @@ async function downloadProducts(context, shellPage, outputDir) {
   return target;
 }
 
+function trackingRequiresPlatformSales(workbook, tracking, freshAfter) {
+  const bundledPython = process.env.USERPROFILE
+    ? path.join(
+      process.env.USERPROFILE,
+      '.cache',
+      'codex-runtimes',
+      'codex-primary-runtime',
+      'dependencies',
+      'python',
+      'python.exe',
+    )
+    : null;
+  const python = process.env.PYTHON_EXECUTABLE
+    || (bundledPython && fs.existsSync(bundledPython) ? bundledPython : 'python');
+  const script = path.join(__dirname, 'check_platform_sales_required.py');
+  const result = spawnSync(python, [
+    script,
+    '--workbook', workbook,
+    '--tracking', tracking,
+    '--fresh-after', String(freshAfter),
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`无法执行旧 Step2 平台 SKU 映射判断：${result.error?.message || result.stderr || result.stdout}`);
+  }
+  const summary = JSON.parse(result.stdout);
+  return {
+    required: Boolean(summary.required),
+    eligibleRows: Number(summary.eligibleRowsAfterTrackingAppend || 0),
+    summary,
+  };
+}
+
 async function main() {
   const requestedKind = arg('kind', 'tracking');
   const kinds = selectedReportKinds(requestedKind);
   const outputDir = path.resolve(arg('download-dir', path.join(process.cwd(), 'downloads')));
+  const workbook = arg('workbook', null);
+  const freshAfter = Date.now() / 1000;
+  if (requestedKind === 'step2-all' && !workbook) {
+    throw new Error('--kind step2-all 必须提供 --workbook，才能沿用旧 Step2 条件判断是否下载平台映射和销售面板。');
+  }
   fs.mkdirSync(outputDir, { recursive: true });
   const executablePath = chromePath();
   if (!executablePath) throw new Error('未找到 Chrome/Edge，请设置 PLAYWRIGHT_CHROME_PATH。');
@@ -781,9 +1092,26 @@ async function main() {
   if (!await waitForAuthenticated(shellPage)) throw new Error('等待钉钉登录超过 5 分钟，未继续执行。');
   console.log(JSON.stringify({ stage: 'authenticated', url: shellPage.url() }, null, 2));
 
+  let trackingPath = null;
+  let platformSalesDecision = null;
   for (const kind of kinds) {
-    if (kind === 'tracking') await downloadTracking(context, outputDir);
+    if (kind === 'tracking') trackingPath = await downloadTracking(context, outputDir);
     if (kind === 'products') await downloadProducts(context, shellPage, outputDir);
+    if (kind === 'platform' || kind === 'sales') {
+      if (workbook && trackingPath && platformSalesDecision == null) {
+        platformSalesDecision = trackingRequiresPlatformSales(path.resolve(workbook), trackingPath, freshAfter);
+        console.log(JSON.stringify({ stage: 'platform-sales-decision', ...platformSalesDecision }, null, 2));
+      }
+      if (platformSalesDecision && !platformSalesDecision.required) {
+        console.log(JSON.stringify({
+          stage: 'skipped',
+          kind,
+          reason: 'legacy-step2-has-no-row-requiring-platform-mapping',
+        }, null, 2));
+        continue;
+      }
+      await downloadGenericReport(context, shellPage, outputDir, kind);
+    }
   }
   await browser.close();
 }
@@ -796,12 +1124,17 @@ if (require.main === module) {
 }
 
 module.exports = {
+  REPORTS,
   clearOtherCheckedSubjectOptions,
+  downloadGenericReport,
   ensureCheckboxOption,
+  isFreshExportRecord,
   isFreshProductRecord,
+  openReportFromMenuSearch,
   recordTimestamp,
   selectedReportKinds,
   selectSingleOption,
+  trackingRequiresPlatformSales,
   userActionRequiredEvent,
   verifyCheckboxOptions,
 };
