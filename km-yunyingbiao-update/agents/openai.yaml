@@ -1,4 +1,6 @@
 interface:
-  display_name: "KMÔËÓª±í×Ô¶¯¸üĞÂ"
-  short_description: "°´¼È¶¨ERP¡¢BIºÍStep2¹æÔò¸üĞÂKMÒ»²¿ÔËÓª±í"
-  default_prompt: "Ê¹ÓÃ $km-yunyingbiao-update ¸üĞÂKMÒ»²¿ÔËÓª±í£¬²¢ÑÏ¸ñ±£»¤ÀÏÈı±í¡£"
+  display_name: "KMä¸€éƒ¨è¿è¥è¡¨è‡ªåŠ¨æ›´æ–°"
+  short_description: "æŒ‰Step1 BIã€Step2 ERPè‡ªåŠ¨åˆ·æ–°è¿è¥è¡¨"
+  default_prompt: "Use $km-yunyingbiao-update to run Step1 BI, Step2 ERP, or the complete two-step refresh locally. Notify me when the visible login browser is ready and use only fresh exports."
+policy:
+  allow_implicit_invocation: true

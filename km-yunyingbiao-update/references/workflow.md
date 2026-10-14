@@ -1,76 +1,126 @@
-# 运营表完整更新规则
+# Step2 ERP运营表刷新流程
 
-## Inputs
+This reference documents the ERP portion of the original two-step workflow. BI overseas-in-transit is Step1 and is documented in `bi-overseas-workflow.md`; the Step2 processor runs after Step1 for a complete refresh, or directly against an approved base workbook for an ERP-only run. A legacy `产品表-老三(含清货淘汰)` sheet is protected when present; a clean template may omit it.
 
-1. Base KM workbook containing `产品表` and `产品表-老三(含清货淘汰)`.
-2. ERP `新品成功率跟踪表（首单）`, exported in **平台SKU** dimension.
-3. ERP `产品档案`, exported with product names.
-4. BI `海外在途预计上架取数`, containing `海外在途预计上架（横版）`.
-5. ERP `我的平台SKU` / `映射-备货信息-运营.xlsx`.
-6. ERP `亚马逊销售面板` export.
+## 1. ERP登录与人工 handoff
 
-For ERP exports, reset retained page filters before choosing the three KM一部 groups. Wait until export records show `已完成` before downloading.
+Open `https://erp.issyzone.net:9999/system/index`. If a DingTalk QR login is shown, stop before login and ask the user to scan. Never use saved credentials or attempt to bypass the scan. The Playwright runner checks the login state every two seconds and resumes automatically when the ERP shell is available; do not require the user to press Enter after scanning.
+Every refresh run must use a new user-authenticated session and newly generated exports. Do not reuse an older export when the user requested the latest data.
+Record `run_start` before opening ERP. The ERP processor must receive `--fresh-after run_start` and reject any tracking, product, platform, or sales export whose filesystem timestamp is older than that value.
 
-## Execution order
+## 2. Export新品成功率跟踪表
 
-### Step 1: BI overseas in-transit
+1. Open 产品模块 -> 新品成功率跟踪表（首单）.
+2. Select `平台SKU维度` and click `展开` when the extended filters are collapsed.
+3. In the 主体 multiselect, ensure exactly these three options are checked: `KM一部一组`, `KM一部二组`, and `KM一部三组`. These names must match exactly; do not substitute the distinct `KM一部1组`, `KM一部2组`, or `KM一部3组` options. Select brand `Kemimoto`, then click `搜索`.
+4. Verify all three主体 selections are checked before exporting; clicking matching text without checking its checkbox state is insufficient.
+5. Start Playwright's download listener, then click `导出` and capture the direct browser download. Do not navigate to 常用操作 or 导出记录 for this report.
+6. Save the file in the run's staging directory and confirm its modified time is later than the export click.
+7. Run `scripts/add_tracking_source_sheet.py` against a new output path. The executor adds/replaces the complete downloaded export as the logical `新品成功率` source worksheet and performs the `产品表` matching, overwrite, append, and yellow-fill rules in sections 4 and 7. Adding the source sheet alone is not a completed Step1 result.
 
-Run `update_overseas_intransit.py` first. It embeds/replaces `海外在途预计上架（横版）`, derives `平台SKU`, and fills blank `新品首批预计到货时间` and `新品首批到货数量` only for eligible launch months and arrivals within the script's 90-day window. Existing arrival values are preserved.
+Before matching, keep only these主体 values: `KM一部一组`, `KM一部二组`, `KM一部三组`.
 
-### ERP tracking and product archive
+## 3. Export产品档案
 
-Filter tracking data to the three allowed groups. Match existing `产品表[平台SKU]` to tracking `平台SKU` and update:
+1. Open 产品模块 -> 产品档案.
+2. Filter brand `Kemimoto`.
+3. Use 导出功能 -> `导出(包括产品名称)`. The live page currently uses half-width parentheses; accept the full-width variant only as a compatibility alias.
+4. Open 常用操作 -> 导出记录.
+5. Locate the newest row whose 报表类型 is `product_export_excel_plus_for_name` and whose 创建时间 belongs to this run. Reload the export-record inner page while polling so the row status and current count are fetched again.
+6. Wait for that same row to show `已完成`, then click its 下载. Never fall back to an older completed row.
+7. Confirm the downloaded file belongs to the current run and was saved to the requested project staging directory.
 
-| 产品表 | ERP新品成功率 |
-| --- | --- |
-| 新品期开售月 | 预计开售时间 |
-| 新品期截止月 | 新品期截止月 |
-| 最新新品成功率 | 预测销量完成比例 |
+Use the newest download timestamp and export-record creation time together. Do not assume the visible filename is unique. Move or copy the verified files to a runtime staging directory outside the Skill source tree; never commit business exports to the Skill repository.
 
-Match `产品表[仓库SKU]` to `ERP产品档案[产品SKU]` and update:
+## 4. 新品成功率表 matching
 
-| 产品表 | ERP产品档案 |
-| --- | --- |
-| 产品名称 | 产品名称 |
-| 三级品类 | 三级品类 |
-| 产品销售状态 | 产品销售状态 |
-| 品类等级 | 产品实际等级 |
+Use `平台SKU` as the unique key in both the source and operation table.
 
-The embedded `ERP产品档案` tab must include `品类等级`, `产品实际等级`, and `产品目标等级`.
+Deduplicate the source before matching and keep the first nonblank occurrence of each `平台SKU`. A repeated source key must not append another row or cause the same destination row to be overwritten more than once by competing source records.
 
-### New SKU rule
+### Existing operation rows
 
-Append a tracking SKU only when all are true:
+- Never delete or modify an existing operation row merely because a source row is old, blank, or ineligible.
+- For an existing key, update only the requested新品成功率追踪 fields when the established workflow calls for it:
+  - `新品期开售月` <- `预计开售时间`
+  - `新品期截止月` <- `新品期截止月`
+  - `最新新品成功率` <- `预测销量完成比例`
+- Treat these three fields as a full refresh for every matched row. A blank source field clears the corresponding destination field. Unmatched operation rows remain unchanged.
 
-- it exists in the filtered ERP tracking export;
-- it is absent from both `产品表` and `产品表-老三(含清货淘汰)`;
-- `预计开售时间` parses successfully and is on or after `2026-01-01`;
-- the source `平台SKU` is nonblank.
+### New operation rows
 
-Use tracking `SKU` as the appended `仓库SKU`. Copy the previous product-row style/formulas where applicable, then populate tracking and product-archive fields. Never append a duplicate source key.
+Add a source row only when all conditions hold:
 
-### Step 2
+- the source `平台SKU` is not already in the operation table;
+- the source key is not a duplicate already selected from the source;
+- `预计开售时间` is parseable;
+- the parsed date is `2026-01-01` or later.
 
-Only rows with both `平台SKU` and `仓库SKU` and blank `店铺别名/主体/运营/备货状态` are eligible.
+Do not add blank, unparseable, 2024, or 2025 dates. Append eligible rows contiguously. Populate the source `平台SKU` and `仓库SKU` fields according to the established operation-table layout. Mark only the new `平台SKU` cell yellow.
 
-- Filter platform and sales exports to the three allowed groups.
-- Exclude platform mappings whose `店铺别名` contains `老三`.
-- For duplicate platform mappings prefer US, then CA, then other sites.
-- Match platform source `平台SKU` and fill `店铺别名`, `主体`, `运营`, `备货状态`.
-- Match sales source `(店铺, MSKU)` to `(店铺别名, 平台SKU)` and fill `ASIN`, `标签01` through `标签10`.
-- Do not blank or overwrite an already populated row.
+## 5. 产品档案 matching
 
-Embed/replace these source tabs instead of creating numbered duplicates:
+Use:
 
-- `ERP新品成功率`
-- `ERP产品档案`
-- `Step2平台SKU映射`
-- `Step2亚马逊销售面板`
+- source key: `产品SKU`
+- operation key: `仓库SKU`
 
-## Formatting and validation
+For a successful match, update only these operation-table fields:
 
-- For every `产品表` row having `平台SKU` or `仓库SKU`, apply thin black borders to A:AQ.
-- Do not apply this formatting to the legacy sheet.
-- Scan formulas and text for `#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`, `#NAME?`, and `#NUM!`. Fail only when the update introduces new errors. Report pre-existing errors, especially those in the protected legacy sheet, without modifying them.
-- Verify the legacy-sheet digest before and after the update.
-- Confirm all expected source tabs exist and no input file was overwritten.
+- `产品名称` <- source `产品名称`
+- `三级品类` <- source `三级品类`
+- `产品销售状态` <- source `产品销售状态`
+- `品类等级` <- source `产品实际等级`
+
+Do not change other operation columns. Preserve unmatched operation rows. Add the complete downloaded 产品档案 export as a source subtable/tab.
+
+For a product-archive-only run, first omit `--output` to validate freshness and match counts, then execute:
+
+```powershell
+python "$skillRoot\scripts\add_product_archive_sheet.py" `
+  --operations "C:\path\KM一部运营表-Step1完整更新.xlsx" `
+  --products "C:\path\产品档案-导出(包括产品名称).xlsx" `
+  --output "C:\path\KM一部运营表-产品档案更新.xlsx" `
+  --fresh-after <run_start_unix_timestamp>
+```
+
+## 6. Source tabs and repeated runs
+
+- Add one source tab for the filtered新品成功率 export and one for the complete产品档案 export.
+- On a repeated run, replace the prior generated tab with the same logical name rather than creating `产品档案1`, `产品档案2`, or equivalent duplicates.
+- Keep the original downloaded files in the runtime staging directory for traceability; do not place business exports under version control.
+
+## 7. Validation before saving
+
+Report at least:
+
+- source export filenames and timestamps;
+- source row count after主体 filtering;
+- duplicate source key count;
+- eligible new SKU count;
+- existing operation rows matched and updated;
+- new rows appended;
+- unmatched operation SKU count;
+- product archive matches and conflicts;
+- blank rows created in the append area;
+- whether only new `平台SKU` cells were yellow;
+- whether appended formulas were translated to the new row rather than copied with stale row references;
+- formula-error scan for `#REF!`, `#VALUE!`, `#N/A`, `#DIV/0!`, `#NAME?`, and `#NUM!`.
+
+Save a new workbook such as `KM一部运营表-YYYYMMDD-ERP自动更新.xlsx`. Never overwrite the original base workbook.
+
+For an ERP新品成功率-only run, execute:
+
+```powershell
+python "$skillRoot\scripts\add_tracking_source_sheet.py" `
+  --operations "C:\path\KM一部运营表.xlsx" `
+  --tracking "C:\path\新品首单成功与否跟踪.xlsx" `
+  --output "C:\path\KM一部运营表-Step2新品成功率更新.xlsx" `
+  --fresh-after <run_start_unix_timestamp>
+```
+
+Run once without `--output` first to validate freshness, exact filters, required columns, duplicate counts, match counts, and eligible append counts.
+
+## Automation boundary
+
+This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind tracking` and `--kind products` for the two ERP exports, then run `scripts/update_erp_step2.py` after the BI step. Fully unattended execution is not appropriate because DingTalk scanning is a user-authentication step and Chrome may require a user-visible download permission confirmation.

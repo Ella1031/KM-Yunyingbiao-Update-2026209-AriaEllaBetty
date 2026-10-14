@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Border, Side
+from openpyxl.styles import Border, PatternFill, Side
+from openpyxl.formula.translate import Translator
 
 
 ALLOWED_GROUPS = ("KM一部一组", "KM一部二组", "KM一部三组")
@@ -106,7 +107,7 @@ def copy_row_style(sheet, source_row, target_row, max_col):
         if source.protection:
             target.protection = copy.copy(source.protection)
         if source.data_type == "f" and isinstance(source.value, str):
-            target.value = source.value
+            target.value = Translator(source.value, origin=source.coordinate).translate_formula(target.coordinate)
     if source_row in sheet.row_dimensions:
         sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
 
@@ -140,6 +141,7 @@ def build_parser():
     parser.add_argument("--platform", required=True, type=Path)
     parser.add_argument("--sales", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--fresh-after", required=True, type=float, help="Unix timestamp; every ERP export must be downloaded after this run start")
     return parser
 
 
@@ -152,6 +154,9 @@ def main():
         raise ValueError("输出文件不能覆盖任何输入文件")
     if args.output.exists():
         raise ValueError(f"输出文件已存在: {args.output}")
+    stale = [str(path) for path in inputs[1:] if path.stat().st_mtime < args.fresh_after]
+    if stale:
+        raise ValueError("检测到非本次运行下载的 ERP 输入文件，已拒绝使用: " + ", ".join(stale))
 
     tracking = pd.read_excel(args.tracking, dtype=str).fillna("")
     require({normalized(c): c for c in tracking.columns}, ["平台SKU", "SKU", "小组", "预计开售时间", "新品期截止月", "预测销量完成比例"], "ERP新品成功率")
@@ -169,9 +174,7 @@ def main():
     if "产品表" not in workbook.sheetnames:
         raise ValueError("工作簿缺少产品表")
     legacy_name = next((name for name in LEGACY_NAMES if name in workbook.sheetnames), None)
-    if not legacy_name:
-        raise ValueError("工作簿缺少产品表-老三(含清货淘汰)，为避免数据丢失已停止")
-    legacy_before = sheet_digest(workbook[legacy_name])
+    legacy_before = sheet_digest(workbook[legacy_name]) if legacy_name else None
     preexisting_errors = formula_errors(workbook)
 
     sheet = workbook["产品表"]
@@ -183,15 +186,17 @@ def main():
     main_skus = set()
     for row in range(3, sheet.max_row + 1):
         main_skus.update(filter(None, (clean(sheet.cell(row, cols[normalized("平台SKU")]).value), clean(sheet.cell(row, cols[normalized("仓库SKU")]).value))))
-    legacy_cols = headers(workbook[legacy_name])
     legacy_skus = set()
-    for key in ("平台SKU", "仓库SKU", "产品SKU"):
-        column = legacy_cols.get(normalized(key))
-        if column:
-            legacy_skus.update(clean(workbook[legacy_name].cell(row, column).value) for row in range(3, workbook[legacy_name].max_row + 1))
+    if legacy_name:
+        legacy_cols = headers(workbook[legacy_name])
+        for key in ("平台SKU", "仓库SKU", "产品SKU"):
+            column = legacy_cols.get(normalized(key))
+            if column:
+                legacy_skus.update(clean(workbook[legacy_name].cell(row, column).value) for row in range(3, workbook[legacy_name].max_row + 1))
     exclusions = main_skus | legacy_skus
 
     appended = 0
+    yellow_fill = PatternFill(fill_type="solid", fgColor="FFFF00")
     for _, source in tracking.iterrows():
         platform_sku = clean(source["平台SKU"])
         warehouse_sku = clean(source["SKU"])
@@ -202,6 +207,7 @@ def main():
         copy_row_style(sheet, target_row - 1, target_row, 43)
         sheet.cell(target_row, cols[normalized("平台SKU")]).value = platform_sku
         sheet.cell(target_row, cols[normalized("仓库SKU")]).value = warehouse_sku or None
+        sheet.cell(target_row, cols[normalized("平台SKU")]).fill = yellow_fill
         exclusions.update(filter(None, (platform_sku, warehouse_sku)))
         appended += 1
 
@@ -272,8 +278,8 @@ def main():
     replace_sheet(workbook, "Step2平台SKU映射", platform)
     replace_sheet(workbook, "Step2亚马逊销售面板", sales)
 
-    legacy_after = sheet_digest(workbook[legacy_name])
-    if legacy_before != legacy_after:
+    legacy_after = sheet_digest(workbook[legacy_name]) if legacy_name else None
+    if legacy_name and legacy_before != legacy_after:
         raise AssertionError("产品表-老三(含清货淘汰)发生变化，已停止保存")
 
     current_errors = formula_errors(workbook)
@@ -284,7 +290,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(args.output)
     saved = load_workbook(args.output)
-    if sheet_digest(saved[legacy_name]) != legacy_before:
+    if legacy_name and sheet_digest(saved[legacy_name]) != legacy_before:
         args.output.unlink(missing_ok=True)
         raise AssertionError("保存后产品表-老三(含清货淘汰)摘要变化，输出已删除")
     saved.close()
@@ -295,11 +301,12 @@ def main():
         "productMatches": product_matches,
         "newSkuAppended": appended,
         "legacySkuExclusions": len(legacy_skus),
+        "legacySheetPresent": bool(legacy_name),
         "step2Eligible": step2_eligible,
         "step2PlatformMatches": step2_platform,
         "step2SalesMatches": step2_sales,
         "borderedRows": bordered,
-        "legacySheetUnchanged": True,
+        "legacySheetUnchanged": True if legacy_name else None,
         "preexistingFormulaErrors": len(preexisting_errors),
         "newFormulaErrors": 0,
     }, ensure_ascii=False, indent=2))

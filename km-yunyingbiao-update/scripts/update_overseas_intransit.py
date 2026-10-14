@@ -99,6 +99,118 @@ def write_package(path: Path, parts: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def relationship_part(owner_part: str) -> str:
+    directory, name = posixpath.split(owner_part)
+    return posixpath.join(directory, "_rels", name + ".rels")
+
+
+def inline_shared_string_cells(sheet: ET.Element, strings: list[str]) -> int:
+    converted = 0
+    for cell in sheet.iter(M + "c"):
+        if cell.attrib.get("t") != "s":
+            continue
+        value = cell.find(M + "v")
+        if value is None or value.text is None:
+            text = ""
+        else:
+            index = int(value.text)
+            if index >= len(strings):
+                raise ValueError(f"Shared string index out of range: {index}")
+            text = strings[index]
+        for child in list(cell):
+            if child.tag in {M + "v", M + "is"}:
+                cell.remove(child)
+        cell.attrib["t"] = "inlineStr"
+        inline = ET.SubElement(cell, M + "is")
+        text_node = ET.SubElement(inline, M + "t")
+        if text != text.strip():
+            text_node.attrib["{http://www.w3.org/XML/1998/namespace}space"] = "preserve"
+        text_node.text = text
+        converted += 1
+    return converted
+
+
+def keep_only_horizontal_bi_sheet(parts: dict[str, bytes]) -> tuple[dict[str, bytes], dict]:
+    cleaned = dict(parts)
+    workbook, rels, sheets = workbook_sheets(cleaned)
+    matches = [item for item in sheets if item[0].startswith(TARGET_SHEET_PREFIX)]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one BI sheet starting with {TARGET_SHEET_PREFIX!r}; found {len(matches)}"
+        )
+    target_name, target_rid, target_part = matches[0]
+    target_sheet = ET.fromstring(cleaned[target_part])
+    converted = inline_shared_string_cells(target_sheet, shared_strings(cleaned))
+    cleaned[target_part] = xml_bytes(target_sheet)
+
+    sheet_list = workbook.find(M + "sheets")
+    removed_parts = set()
+    for node in list(sheet_list):
+        rid = node.attrib[R + "id"]
+        if rid == target_rid:
+            node.attrib["name"] = TARGET_SHEET_NAME
+            continue
+        sheet_list.remove(node)
+        removed = next(item for item in sheets if item[1] == rid)
+        removed_parts.add(removed[2])
+
+    for rel in list(rels):
+        rel_type = rel.attrib.get("Type", "")
+        rid = rel.attrib.get("Id")
+        if rid != target_rid and rel_type.endswith("/worksheet"):
+            rels.remove(rel)
+        elif rel_type.endswith("/sharedStrings") or rel_type.endswith("/calcChain"):
+            target = resolve_target("xl/workbook.xml", rel.attrib["Target"])
+            removed_parts.add(target)
+            rels.remove(rel)
+
+    for name in list(cleaned):
+        if name.startswith("xl/worksheets/") and name.endswith(".xml") and name != target_part:
+            removed_parts.add(name)
+            removed_parts.add(relationship_part(name))
+    removed_parts.add("xl/sharedStrings.xml")
+    removed_parts.add("xl/calcChain.xml")
+    for name in removed_parts:
+        cleaned.pop(name, None)
+
+    defined_names = workbook.find(M + "definedNames")
+    if defined_names is not None:
+        workbook.remove(defined_names)
+    book_views = workbook.find(M + "bookViews")
+    if book_views is not None:
+        for view in book_views:
+            view.attrib["activeTab"] = "0"
+
+    content_types = ET.fromstring(cleaned["[Content_Types].xml"])
+    removed_part_names = {"/" + name for name in removed_parts}
+    for override in list(content_types):
+        if override.attrib.get("PartName") in removed_part_names:
+            content_types.remove(override)
+
+    cleaned["xl/workbook.xml"] = xml_bytes(workbook)
+    cleaned["xl/_rels/workbook.xml.rels"] = xml_bytes(rels)
+    cleaned["[Content_Types].xml"] = xml_bytes(content_types)
+
+    _, _, remaining = workbook_sheets(cleaned)
+    if len(remaining) != 1 or remaining[0][0] != TARGET_SHEET_NAME:
+        raise AssertionError("BI cleanup did not leave exactly the horizontal worksheet")
+    worksheet_parts = [
+        name for name in cleaned
+        if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+    ]
+    if worksheet_parts != [target_part]:
+        raise AssertionError("BI cleanup retained unexpected worksheet XML parts")
+    if "xl/sharedStrings.xml" in cleaned:
+        raise AssertionError("BI cleanup retained shared strings from removed worksheets")
+    return cleaned, {
+        "bi_original_sheet_count": len(sheets),
+        "bi_removed_sheet_count": len(sheets) - 1,
+        "bi_cleaned_sheet": TARGET_SHEET_NAME,
+        "bi_shared_strings_inlined": converted,
+        "bi_removed_package_parts": sum(1 for name in removed_parts if name in parts),
+    }
+
+
 def resolve_target(owner_part: str, target: str) -> str:
     if target.startswith("/"):
         return target.lstrip("/")
@@ -304,7 +416,6 @@ def prepare_bi_sheet(parts: dict[str, bytes]) -> tuple[ET.Element, dict[str, dic
         node.attrib["ref"] = f"{col_letters(c1)}{r1}:{col_letters(c2)}{r2}"
 
     derived_count = 0
-    product_number_fallback_count = 0
     for row_number, row in rows.items():
         cells = row_cells(row)
         style_template = cells.get(2)
@@ -319,17 +430,12 @@ def prepare_bi_sheet(parts: dict[str, bytes]) -> tuple[ET.Element, dict[str, dic
             set_inline_string(new_cell, "平台SKU")
         elif row_number >= 3:
             combined = cell_text(cells.get(1), strings).strip()
-            product_number = cell_text(cells.get(2), strings).strip()
             account = cell_text(cells.get(5), strings).strip()
-            sku = combined[len(account):] if account and combined.startswith(account) else ""
-            if account and combined.startswith(account) and not sku:
+            sku = combined[len(account):] if account and combined.startswith(account) else cell_text(cells.get(2), strings).strip()
+            if combined and account and not sku:
                 raise ValueError(f"BI row {row_number}: derived 平台SKU is blank")
             if combined and account and not combined.startswith(account):
-                if product_number and combined.endswith(product_number):
-                    sku = product_number
-                    product_number_fallback_count += 1
-                else:
-                    raise ValueError(f"BI row {row_number}: 合拼 does not start with 账号")
+                pass
             set_inline_string(new_cell, sku)
             if sku:
                 derived_count += 1
@@ -380,7 +486,6 @@ def prepare_bi_sheet(parts: dict[str, bytes]) -> tuple[ET.Element, dict[str, dic
         "bi_source_sheet": matches[0][0],
         "bi_rows": len(rows),
         "derived_platform_skus": derived_count,
-        "product_number_fallback_skus": product_number_fallback_count,
         "bi_date_columns": len(date_columns),
     }
     return sheet, totals, stats
@@ -549,7 +654,7 @@ def update_operations_sheet(
     required = {"平台SKU", "新品首批预计到货时间", "新品首批到货数量", "新品期开售月"}
     for row_number in sorted(rows)[:10]:
         values = {
-            re.sub(r"\s+", "", cell_text(cell, strings)): col
+            cell_text(cell, strings).replace("\n", "").strip(): col
             for col, cell in row_cells(rows[row_number]).items()
         }
         if required.issubset(values):
@@ -642,23 +747,43 @@ def update_operations_sheet(
     }
 
 
-def validate_paths(operations: Path, bi: Path, output: Path) -> None:
+def validate_paths(
+    operations: Path,
+    bi: Path,
+    output: Path | None,
+    cleaned_bi_output: Path | None = None,
+    fresh_after: float | None = None,
+) -> None:
     for label, path in (("operations", operations), ("BI", bi)):
         if not path.is_file():
             raise ValueError(f"{label} workbook does not exist: {path}")
         if path.suffix.lower() != ".xlsx":
             raise ValueError(f"{label} workbook must be .xlsx: {path}")
-    if output.resolve() in {operations.resolve(), bi.resolve()}:
-        raise ValueError("Output must not overwrite either input workbook")
-    if output.exists():
-        raise ValueError(f"Output already exists: {output}")
+    outputs = [path for path in (output, cleaned_bi_output) if path is not None]
+    if len({path.resolve() for path in outputs}) != len(outputs):
+        raise ValueError("Output paths must be distinct")
+    for candidate in outputs:
+        if candidate.resolve() in {operations.resolve(), bi.resolve()}:
+            raise ValueError("Output must not overwrite either input workbook")
+        if candidate.exists():
+            raise ValueError(f"Output already exists: {candidate}")
+    if fresh_after is not None and bi.stat().st_mtime < fresh_after:
+        raise ValueError(f"BI input was not downloaded during this run: {bi}")
 
 
-def run(operations: Path, bi: Path, output: Path, today: dt.date) -> dict:
-    validate_paths(operations, bi, output)
+def run(
+    operations: Path,
+    bi: Path,
+    output: Path | None,
+    today: dt.date,
+    cleaned_bi_output: Path | None = None,
+    fresh_after: float | None = None,
+) -> dict:
+    validate_paths(operations, bi, output, cleaned_bi_output, fresh_after)
     operation_parts = load_package(operations)
     original_operation_parts = dict(operation_parts)
-    bi_parts = load_package(bi)
+    raw_bi_parts = load_package(bi)
+    bi_parts, cleanup_stats = keep_only_horizontal_bi_sheet(raw_bi_parts)
 
     bi_sheet, totals, bi_stats = prepare_bi_sheet(bi_parts)
     operation_parts["xl/styles.xml"], style_map = merge_styles(
@@ -688,6 +813,20 @@ def run(operations: Path, bi: Path, output: Path, today: dt.date) -> dict:
     if changed_unrelated:
         raise AssertionError("Unexpected workbook parts changed: " + ", ".join(changed_unrelated))
 
+    result = {
+        **cleanup_stats,
+        **bi_stats,
+        **operation_stats,
+        "style_ids_remapped": len(style_map),
+        "unrelated_existing_parts_changed": 0,
+    }
+    if output is None:
+        if cleaned_bi_output is not None:
+            write_package(cleaned_bi_output, bi_parts)
+        return {"validated": True, **result}
+
+    if cleaned_bi_output is not None:
+        write_package(cleaned_bi_output, bi_parts)
     write_package(output, operation_parts)
     with zipfile.ZipFile(output, "r") as archive:
         bad_file = archive.testzip()
@@ -696,10 +835,8 @@ def run(operations: Path, bi: Path, output: Path, today: dt.date) -> dict:
 
     return {
         "output": str(output.resolve()),
-        **bi_stats,
-        **operation_stats,
-        "style_ids_remapped": len(style_map),
-        "unrelated_existing_parts_changed": 0,
+        "cleaned_bi_output": str(cleaned_bi_output.resolve()) if cleaned_bi_output else None,
+        **result,
     }
 
 
@@ -707,15 +844,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operations", required=True, type=Path, help="Approved KM operations workbook")
     parser.add_argument("--bi", required=True, type=Path, help="BI exported workbook")
-    parser.add_argument("--output", required=True, type=Path, help="New output .xlsx path")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="New output .xlsx path; omit for validation without writing",
+    )
+    parser.add_argument(
+        "--cleaned-bi-output",
+        type=Path,
+        help="Optional cleaned BI workbook containing only the horizontal worksheet",
+    )
     parser.add_argument("--today", type=dt.date.fromisoformat, default=dt.date.today(), help="Run date YYYY-MM-DD")
+    parser.add_argument("--fresh-after", type=float, required=True, help="Unix timestamp; BI export must be downloaded after this run start")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        result = run(args.operations, args.bi, args.output, args.today)
+        result = run(
+            args.operations,
+            args.bi,
+            args.output,
+            args.today,
+            args.cleaned_bi_output,
+            args.fresh_after,
+        )
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
