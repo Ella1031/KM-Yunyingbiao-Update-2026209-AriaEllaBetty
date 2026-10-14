@@ -474,11 +474,18 @@ async function filterControlDiagnostic(frame) {
 
 async function optionChecked(option) {
   const checkbox = option.locator('input[type="checkbox"]').first();
-  if (await checkbox.count()) return checkbox.isChecked().catch(() => false);
-  const aria = await option.getAttribute('aria-checked').catch(() => null);
-  const selected = await option.getAttribute('aria-selected').catch(() => null);
-  const classes = await option.getAttribute('class').catch(() => '');
-  return aria === 'true' || selected === 'true' || /is-checked|selected/.test(classes || '');
+  if (await checkbox.count() && await checkbox.isChecked().catch(() => false)) return true;
+  return option.evaluate((node) => {
+    const nodes = [node, ...node.querySelectorAll('*')];
+    return nodes.some((candidate) => {
+      const ariaChecked = candidate.getAttribute && candidate.getAttribute('aria-checked');
+      const ariaSelected = candidate.getAttribute && candidate.getAttribute('aria-selected');
+      const classes = candidate.classList ? [...candidate.classList] : [];
+      return ariaChecked === 'true'
+        || ariaSelected === 'true'
+        || classes.some((name) => ['is-checked', 'is-selected', 'selected', 'checked'].includes(name));
+    });
+  }).catch(() => false);
 }
 
 async function normalizeOption(option) {
@@ -541,14 +548,31 @@ async function ensureComboboxOpen(combobox) {
 }
 
 async function ensureCheckboxOption(frame, aliases, combobox = null) {
-  const found = await findVisibleOption(frame, aliases, combobox);
+  let found = await findVisibleOption(frame, aliases, combobox);
   if (!found) throw new Error(`主体下拉中未找到选项：${aliases.join(' / ')}`);
   if (!await optionChecked(found.option)) {
-    await found.option.click({ timeout: 1500 }).catch(() => found.option.evaluate((node) => node.click()));
-    await frame.waitForTimeout(250);
+    const preferredTarget = found.option.locator('.el-checkbox__input, .el-checkbox__label').first();
+    const clickTarget = await preferredTarget.count() ? preferredTarget : found.option;
+    await clickTarget.click({ timeout: 1500 }).catch(() => found.option.evaluate((node) => node.click()));
+
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      await frame.waitForTimeout(100);
+      found = await findVisibleOption(frame, aliases, combobox);
+      if (found && await optionChecked(found.option)) break;
+    }
   }
-  if (!await optionChecked(found.option)) throw new Error(`主体选项未能勾选：${found.alias}`);
+  if (!found || !await optionChecked(found.option)) throw new Error(`主体选项未能勾选：${aliases[0]}`);
   return found.alias;
+}
+
+async function verifyCheckboxOptions(frame, requiredNames, combobox = null) {
+  const missing = [];
+  for (const name of requiredNames) {
+    const found = await findVisibleOption(frame, [name], combobox);
+    if (!found || !await optionChecked(found.option)) missing.push(name);
+  }
+  if (missing.length) throw new Error(`主体最终校验未通过，未选中：${missing.join(', ')}`);
 }
 
 async function clearOtherCheckedSubjectOptions(frame, allowedNames, combobox) {
@@ -655,6 +679,7 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
     await clearOtherCheckedSubjectOptions(frame, requiredSubjects, subjectSelect);
     for (const subject of requiredSubjects) done.push(await ensureCheckboxOption(frame, [subject], subjectSelect));
     await clearOtherCheckedSubjectOptions(frame, requiredSubjects, subjectSelect);
+    await verifyCheckboxOptions(frame, requiredSubjects, subjectSelect);
     await page.keyboard.press('Escape').catch(() => {});
 
     const search = await firstVisible(frame.getByText('搜索', { exact: true }));
@@ -773,4 +798,5 @@ module.exports = {
   recordTimestamp,
   selectSingleOption,
   userActionRequiredEvent,
+  verifyCheckboxOptions,
 };

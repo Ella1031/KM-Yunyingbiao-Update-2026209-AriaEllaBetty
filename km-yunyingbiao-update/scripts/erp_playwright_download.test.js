@@ -11,6 +11,7 @@ const {
   recordTimestamp,
   selectSingleOption,
   userActionRequiredEvent,
+  verifyCheckboxOptions,
 } = require('./erp_playwright_download');
 
 function chromePath() {
@@ -66,6 +67,30 @@ async function main() {
     'KM一部三组': true,
     '其他主体': false,
   });
+
+  await page.setContent(`
+    <input id="element-subject" role="combobox" aria-controls="element-list" aria-expanded="true">
+    <div id="element-list" class="el-popper">
+      <label class="el-checkbox is-checked" data-name="already-selected" onclick="this.dataset.clicked='yes'">
+        <span class="el-checkbox__input is-checked"><span class="el-checkbox__inner"></span><input class="el-checkbox__original" type="checkbox"></span>
+        <span class="el-checkbox__label">KM一部一组</span>
+      </label>
+      <label class="el-checkbox" data-name="rerendered" onclick="const next=this.cloneNode(true); next.classList.add('is-checked'); next.querySelector('.el-checkbox__input').classList.add('is-checked'); this.replaceWith(next)">
+        <span class="el-checkbox__input"><span class="el-checkbox__inner"></span><input class="el-checkbox__original" type="checkbox"></span>
+        <span class="el-checkbox__label">KM一部二组</span>
+      </label>
+      <label class="el-checkbox" data-name="third" onclick="this.classList.add('is-checked'); this.querySelector('.el-checkbox__input').classList.add('is-checked')">
+        <span class="el-checkbox__input"><span class="el-checkbox__inner"></span><input class="el-checkbox__original" type="checkbox"></span>
+        <span class="el-checkbox__label">KM一部三组</span>
+      </label>
+    </div>
+  `);
+  const elementSubject = page.locator('#element-subject');
+  for (const name of required) await ensureCheckboxOption(page.mainFrame(), [name], elementSubject);
+  await verifyCheckboxOptions(page.mainFrame(), required, elementSubject);
+  assert.strictEqual(await page.locator('[data-name="already-selected"]').getAttribute('data-clicked'), null);
+  assert.ok((await page.locator('[data-name="rerendered"]').getAttribute('class')).includes('is-checked'));
+  assert.ok((await page.locator('[data-name="third"]').getAttribute('class')).includes('is-checked'));
 
   await browser.close();
 assert.ok(recordTimestamp('2026-10-13 14:44:52') > 0);
