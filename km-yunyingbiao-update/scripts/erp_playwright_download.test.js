@@ -9,6 +9,7 @@ const {
   ensureCheckboxOption,
   isFreshProductRecord,
   recordTimestamp,
+  selectedReportKinds,
   selectSingleOption,
   userActionRequiredEvent,
   verifyCheckboxOptions,
@@ -95,6 +96,9 @@ async function main() {
   await browser.close();
 assert.ok(recordTimestamp('2026-10-13 14:44:52') > 0);
 assert.strictEqual(recordTimestamp('no timestamp'), null);
+assert.deepStrictEqual(selectedReportKinds('tracking-products'), ['tracking', 'products']);
+assert.deepStrictEqual(selectedReportKinds('tracking'), ['tracking']);
+assert.throws(() => selectedReportKinds('all'), /tracking-products/);
 const exportedAt = new Date(2026, 9, 13, 14, 58, 4).getTime();
 assert.strictEqual(
   isFreshProductRecord('product_export_excel_plus_for_name 2026-10-13 14:58:05 运算中', exportedAt),

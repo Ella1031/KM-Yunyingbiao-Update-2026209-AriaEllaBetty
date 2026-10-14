@@ -8,6 +8,8 @@ Open `https://erp.issyzone.net:9999/system/index`. If a DingTalk QR login is sho
 Every refresh run must use a new user-authenticated session and newly generated exports. Do not reuse an older export when the user requested the latest data.
 Record `run_start` before opening ERP. The ERP processor must receive `--fresh-after run_start` and reject any tracking, product, platform, or sales export whose filesystem timestamp is older than that value.
 
+For a complete Step2 run, use `--kind tracking-products` so 新品成功率 and 产品档案 are exported in one browser context after one DingTalk scan. Use the individual `tracking` or `products` modes only for a deliberately isolated report test or refresh.
+
 ## 2. Export新品成功率跟踪表
 
 1. Open 产品模块 -> 新品成功率跟踪表（首单）.

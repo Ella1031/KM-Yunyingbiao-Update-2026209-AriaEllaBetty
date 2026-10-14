@@ -31,6 +31,12 @@ function arg(name, fallback) {
   return i >= 0 ? process.argv[i + 1] : fallback;
 }
 
+function selectedReportKinds(kind) {
+  if (kind === 'tracking-products') return ['tracking', 'products'];
+  if (REPORTS[kind]) return [kind];
+  throw new Error('--kind 必须是 tracking、products 或 tracking-products');
+}
+
 function chromePath() {
   return [
     process.env.PLAYWRIGHT_CHROME_PATH,
@@ -693,71 +699,31 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
   return done;
 }
 
-async function main() {
-  const kind = arg('kind', 'tracking');
+async function saveDownload(download, outputDir, exportedAt, kind) {
+  const filename = download.suggestedFilename();
+  let target = path.join(outputDir, filename);
+  if (fs.existsSync(target)) {
+    const extension = path.extname(filename);
+    target = path.join(outputDir, `${path.basename(filename, extension)}-${Date.now()}${extension}`);
+  }
+  await download.saveAs(target);
+  const saved = fs.statSync(target);
+  if (saved.mtimeMs < exportedAt - 2000) throw new Error(`下载文件时间早于本次导出：${target}`);
+  console.log(JSON.stringify({ stage: 'downloaded', kind, path: target, suggestedFilename: filename }, null, 2));
+  return target;
+}
+
+async function downloadTracking(context, outputDir) {
+  const kind = 'tracking';
   const config = REPORTS[kind];
-  if (!config) throw new Error('--kind 必须是 tracking 或 products');
-  const outputDir = path.resolve(arg('download-dir', path.join(process.cwd(), 'downloads')));
-  fs.mkdirSync(outputDir, { recursive: true });
-  const executablePath = chromePath();
-  if (!executablePath) throw new Error('未找到 Chrome/Edge，请设置 PLAYWRIGHT_CHROME_PATH。');
-
-  const browser = await chromium.launch({ headless: false, executablePath });
-  const context = await browser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
-  await page.goto(ERP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  console.log(JSON.stringify({ stage: 'opened', url: page.url(), title: await page.title() }, null, 2));
-  console.log(JSON.stringify(userActionRequiredEvent(), null, 2));
-  console.log('请在浏览器中完成钉钉扫码登录，脚本会自动识别登录成功。');
-  if (!await waitForAuthenticated(page)) throw new Error('等待钉钉登录超过 5 分钟，未继续执行。');
-  console.log(JSON.stringify({ stage: 'authenticated', url: page.url() }, null, 2));
-
-  if (kind === 'products') {
-    const productPage = await context.newPage();
-    await productPage.goto(PRODUCT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    const productFrame = await frameContaining(productPage, ['产品档案'], 30000) || productPage.mainFrame();
-    const automated = ['产品档案', ...(await applyProductFilters(productFrame))];
-    console.log(JSON.stringify({ stage: 'filters', automated, productUrl: productFrame.url() }, null, 2));
-
-    const exportedAt = Date.now();
-    const directDownloadPromise = productPage.waitForEvent('download', { timeout: 10000 }).catch(() => null);
-    await clickProductExport(productFrame);
-    let download = await directDownloadPromise;
-    if (!download) {
-      const records = await openExportRecords(page);
-      download = await waitForProductExportDownload(records.owner, records.frame, exportedAt);
-    }
-
-    const filename = download.suggestedFilename();
-    let target = path.join(outputDir, filename);
-    if (fs.existsSync(target)) {
-      const extension = path.extname(filename);
-      target = path.join(outputDir, `${path.basename(filename, extension)}-${Date.now()}${extension}`);
-    }
-    await download.saveAs(target);
-    const saved = fs.statSync(target);
-    if (saved.mtimeMs < exportedAt - 2000) throw new Error(`下载文件时间早于本次导出：${target}`);
-    console.log(JSON.stringify({ stage: 'downloaded', kind, path: target, suggestedFilename: filename }, null, 2));
-    await browser.close();
-    return;
-  }
-
-  if (kind === 'tracking') {
-    await page.goto('https://erp.issyzone.net:9999/ipdv/#/production-research/new-product/first-order-tracking', {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
-  }
-
+  await page.goto('https://erp.issyzone.net:9999/ipdv/#/production-research/new-product/first-order-tracking', {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  });
   const automated = await openReportAndApplyKnownFilters(page, config, kind);
   console.log(JSON.stringify({ stage: 'filters', automated }, null, 2));
-  if (kind !== 'tracking' && !automated.includes(config.name)) {
-    const body = await page.locator('body').innerText().catch(() => '');
-    console.log(JSON.stringify({ stage: 'diagnostic', frameUrls: page.frames().map((frame) => frame.url()), bodyPreview: body.slice(0, 1200) }, null, 2));
-    console.log(config.instructions);
-    await ask('自动打开报表失败。请手动打开并完成筛选后按 Enter');
-  }
-  const reportFrame = kind === 'tracking' ? await waitForTrackingFrame(page, 10000) : page;
+  const reportFrame = await waitForTrackingFrame(page, 10000);
   if (!reportFrame) throw new Error('搜索后报表页面不可用，无法导出。');
   const exportButton = reportFrame.getByText(config.exportText, { exact: true }).first();
   if (!(await exportButton.count()) || !(await exportButton.isVisible().catch(() => false))) {
@@ -771,16 +737,54 @@ async function main() {
   const downloadPromise = page.waitForEvent('download', { timeout: 180000 });
   await exportButton.click();
   const download = await downloadPromise;
-  const filename = download.suggestedFilename();
-  let target = path.join(outputDir, filename);
-  if (fs.existsSync(target)) {
-    const extension = path.extname(filename);
-    target = path.join(outputDir, `${path.basename(filename, extension)}-${Date.now()}${extension}`);
+  const target = await saveDownload(download, outputDir, exportedAt, kind);
+  await page.close();
+  return target;
+}
+
+async function downloadProducts(context, shellPage, outputDir) {
+  const kind = 'products';
+  const productPage = await context.newPage();
+  await productPage.goto(PRODUCT_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const productFrame = await frameContaining(productPage, ['产品档案'], 30000) || productPage.mainFrame();
+  const automated = ['产品档案', ...(await applyProductFilters(productFrame))];
+  console.log(JSON.stringify({ stage: 'filters', automated, productUrl: productFrame.url() }, null, 2));
+
+  const exportedAt = Date.now();
+  const directDownloadPromise = productPage.waitForEvent('download', { timeout: 10000 }).catch(() => null);
+  await clickProductExport(productFrame);
+  let download = await directDownloadPromise;
+  if (!download) {
+    const records = await openExportRecords(shellPage);
+    download = await waitForProductExportDownload(records.owner, records.frame, exportedAt);
   }
-  await download.saveAs(target);
-  const saved = fs.statSync(target);
-  if (saved.mtimeMs < exportedAt - 2000) throw new Error(`下载文件时间早于本次导出：${target}`);
-  console.log(JSON.stringify({ stage: 'downloaded', kind, path: target, suggestedFilename: filename }, null, 2));
+  const target = await saveDownload(download, outputDir, exportedAt, kind);
+  await productPage.close();
+  return target;
+}
+
+async function main() {
+  const requestedKind = arg('kind', 'tracking');
+  const kinds = selectedReportKinds(requestedKind);
+  const outputDir = path.resolve(arg('download-dir', path.join(process.cwd(), 'downloads')));
+  fs.mkdirSync(outputDir, { recursive: true });
+  const executablePath = chromePath();
+  if (!executablePath) throw new Error('未找到 Chrome/Edge，请设置 PLAYWRIGHT_CHROME_PATH。');
+
+  const browser = await chromium.launch({ headless: false, executablePath });
+  const context = await browser.newContext({ acceptDownloads: true });
+  const shellPage = await context.newPage();
+  await shellPage.goto(ERP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  console.log(JSON.stringify({ stage: 'opened', url: shellPage.url(), title: await shellPage.title(), kinds }, null, 2));
+  console.log(JSON.stringify(userActionRequiredEvent(), null, 2));
+  console.log('请在浏览器中完成钉钉扫码登录，脚本会自动识别登录成功。');
+  if (!await waitForAuthenticated(shellPage)) throw new Error('等待钉钉登录超过 5 分钟，未继续执行。');
+  console.log(JSON.stringify({ stage: 'authenticated', url: shellPage.url() }, null, 2));
+
+  for (const kind of kinds) {
+    if (kind === 'tracking') await downloadTracking(context, outputDir);
+    if (kind === 'products') await downloadProducts(context, shellPage, outputDir);
+  }
   await browser.close();
 }
 
@@ -796,6 +800,7 @@ module.exports = {
   ensureCheckboxOption,
   isFreshProductRecord,
   recordTimestamp,
+  selectedReportKinds,
   selectSingleOption,
   userActionRequiredEvent,
   verifyCheckboxOptions,
