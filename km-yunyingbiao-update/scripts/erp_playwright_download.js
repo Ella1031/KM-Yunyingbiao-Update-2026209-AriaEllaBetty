@@ -718,6 +718,92 @@ async function filterControlDiagnostic(frame) {
   return { inputs, selects };
 }
 
+const OPTION_SELECTOR = [
+  'label.el-checkbox',
+  '[role="option"]',
+  '.el-select-dropdown__item',
+  '.el-cascader-node',
+  '.ant-select-item-option',
+  '.vue-treeselect__option',
+].join(', ');
+
+const POPUP_SELECTOR = [
+  '.el-popper:visible',
+  '.el-select-dropdown:visible',
+  '.el-cascader__dropdown:visible',
+  '.ant-select-dropdown:visible',
+  '.vue-treeselect__menu:visible',
+  '[role="listbox"]:visible',
+].join(', ');
+
+async function selectionControlRoot(combobox) {
+  if (!combobox || !await combobox.count()) return null;
+  const root = combobox.locator([
+    'xpath=ancestor::*[',
+    'contains(concat(" ", normalize-space(@class), " "), " el-select ")',
+    ' or contains(concat(" ", normalize-space(@class), " "), " el-cascader ")',
+    ' or contains(concat(" ", normalize-space(@class), " "), " ant-select ")',
+    ' or contains(concat(" ", normalize-space(@class), " "), " vue-treeselect ")',
+    '][1]',
+  ].join(''));
+  if (await root.count()) return root.first();
+  return combobox.locator('xpath=parent::*').first();
+}
+
+async function selectedControlTexts(combobox) {
+  const root = await selectionControlRoot(combobox);
+  if (!root || !await root.count()) return [];
+  const texts = await root.locator([
+    '.el-tag',
+    '.el-select__tags-text',
+    '.el-select__selected-item',
+    '.ant-select-selection-item',
+    '.vue-treeselect__multi-value-item',
+    '[data-selected="true"]',
+  ].join(', ')).evaluateAll((nodes) => nodes.map((node) => (
+    node.getAttribute('title') || node.textContent || ''
+  ))).catch(() => []);
+  return texts
+    .flatMap((text) => text.split(/[\r\n,，]/))
+    .map((text) => text.replace(/[×x]\s*$/, '').replace(/\s+/g, ''))
+    .filter(Boolean);
+}
+
+async function selectionStateDiagnostic(frame, combobox) {
+  const root = await selectionControlRoot(combobox);
+  const controlled = await controlledPopup(frame, combobox);
+  const visiblePopups = frame.locator(POPUP_SELECTOR);
+  const popupCount = await visiblePopups.count().catch(() => 0);
+  const popups = [];
+  for (let i = 0; i < Math.min(popupCount, 8); i += 1) {
+    const popup = visiblePopups.nth(i);
+    popups.push({
+      text: (await popup.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 2000),
+      html: (await popup.evaluate((node) => node.outerHTML).catch(() => '')).slice(0, 6000),
+      options: await popup.locator(OPTION_SELECTOR).evaluateAll((nodes) => nodes.slice(0, 80).map((node) => ({
+        text: (node.textContent || '').replace(/\s+/g, ' ').trim(),
+        class: node.className,
+        ariaChecked: node.getAttribute('aria-checked'),
+        ariaSelected: node.getAttribute('aria-selected'),
+        checked: Boolean(node.querySelector('input[type="checkbox"]')?.checked),
+      }))).catch(() => []),
+    });
+  }
+  return {
+    comboboxHtml: combobox && await combobox.count()
+      ? (await combobox.evaluate((node) => node.outerHTML).catch(() => '')).slice(0, 3000)
+      : '',
+    controlHtml: root && await root.count()
+      ? (await root.evaluate((node) => node.outerHTML).catch(() => '')).slice(0, 6000)
+      : '',
+    selectedTexts: await selectedControlTexts(combobox),
+    controlledPopupHtml: controlled
+      ? (await controlled.evaluate((node) => node.outerHTML).catch(() => '')).slice(0, 6000)
+      : '',
+    popups,
+  };
+}
+
 async function optionChecked(option) {
   const checkbox = option.locator('input[type="checkbox"]').first();
   if (await checkbox.count() && await checkbox.isChecked().catch(() => false)) return true;
@@ -741,6 +827,8 @@ async function normalizeOption(option) {
   if (await roleOption.count()) return roleOption;
   const dropdownItem = option.locator('xpath=ancestor-or-self::*[contains(concat(" ", normalize-space(@class), " "), " el-select-dropdown__item ")][1]');
   if (await dropdownItem.count()) return dropdownItem;
+  const genericOption = option.locator('xpath=ancestor-or-self::*[@role="option" or contains(concat(" ", normalize-space(@class), " "), " ant-select-item-option ") or contains(concat(" ", normalize-space(@class), " "), " el-cascader-node ")][1]');
+  if (await genericOption.count()) return genericOption;
   return option;
 }
 
@@ -753,7 +841,7 @@ async function controlledPopup(frame, combobox) {
 }
 
 async function visiblePopupContaining(frame, requiredTexts) {
-  const popups = frame.locator('.el-popper:visible, .el-select-dropdown:visible');
+  const popups = frame.locator(POPUP_SELECTOR);
   const count = await popups.count();
   for (let i = 0; i < count; i += 1) {
     const popup = popups.nth(i);
@@ -771,9 +859,21 @@ function normalizeRequiredOptions(requiredOptions) {
   });
 }
 
+function normalizedOptionText(value) {
+  return String(value || '').normalize('NFKC').replace(/\s+/g, '');
+}
+
+function optionTextMatchesAlias(text, alias) {
+  const candidate = normalizedOptionText(text);
+  const expected = normalizedOptionText(alias);
+  return candidate === expected
+    || candidate.endsWith(`【${expected}】`)
+    || candidate.endsWith(`[${expected}]`);
+}
+
 async function visiblePopupContainingOptions(frame, requiredOptions) {
   const options = normalizeRequiredOptions(requiredOptions);
-  const popups = frame.locator('.el-popper:visible, .el-select-dropdown:visible');
+  const popups = frame.locator(POPUP_SELECTOR);
   const count = await popups.count();
   for (let i = 0; i < count; i += 1) {
     const popup = popups.nth(i);
@@ -787,15 +887,14 @@ async function visiblePopupContainingOptions(frame, requiredOptions) {
 
 async function findVisibleOption(frame, aliases, combobox = null) {
   const popup = await controlledPopup(frame, combobox);
-  const normalizedAliases = new Map(aliases.map((alias) => [alias.replace(/\s+/g, ''), alias]));
   async function exactOptionIn(container) {
-    const candidates = container.locator('label.el-checkbox, [role="option"], .el-select-dropdown__item');
+    const candidates = container.locator(OPTION_SELECTOR);
     const count = await candidates.count().catch(() => 0);
     for (let i = 0; i < count; i += 1) {
       const candidate = candidates.nth(i);
       if (!await candidate.isVisible().catch(() => false)) continue;
-      const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, '');
-      const alias = normalizedAliases.get(text);
+      const text = await candidate.innerText().catch(() => '');
+      const alias = aliases.find((item) => optionTextMatchesAlias(text, item));
       if (alias) return { option: await normalizeOption(candidate), alias };
     }
     return null;
@@ -809,6 +908,7 @@ async function findVisibleOption(frame, aliases, combobox = null) {
       frame.locator('.el-popper:visible').getByText(alias, { exact: true }),
       frame.locator('label.el-checkbox').filter({ hasText: alias }),
       frame.locator('.el-select-dropdown__item').filter({ hasText: alias }),
+      frame.locator('.ant-select-item-option, .el-cascader-node, .vue-treeselect__option').filter({ hasText: alias }),
       frame.getByRole('option', { name: alias, exact: true }),
       frame.getByText(alias, { exact: true }),
     ];
@@ -818,14 +918,14 @@ async function findVisibleOption(frame, aliases, combobox = null) {
     }
   }
   if (popup) {
-    const expected = new Set(aliases.map((alias) => alias.replace(/\s+/g, '')));
-    const labels = popup.locator('label.el-checkbox, [role="option"], .el-select-dropdown__item');
+    const labels = popup.locator(OPTION_SELECTOR);
     const count = await labels.count();
     for (let i = 0; i < count; i += 1) {
       const candidate = labels.nth(i);
       if (!await candidate.isVisible().catch(() => false)) continue;
-      const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, '');
-      if (expected.has(text)) return { option: await normalizeOption(candidate), alias: aliases[0] };
+      const text = await candidate.innerText().catch(() => '');
+      const alias = aliases.find((item) => optionTextMatchesAlias(text, item));
+      if (alias) return { option: await normalizeOption(candidate), alias };
     }
   }
   return null;
@@ -849,28 +949,25 @@ async function ensureComboboxOpen(combobox) {
 
 async function comboboxHasSelection(combobox, aliases) {
   if (!combobox || !await combobox.count()) return false;
-  const root = combobox.locator(
-    'xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " el-select ")][1]',
-  );
-  if (!await root.count()) return false;
-  const selectedTexts = await root.locator(
-    '.el-tag, .el-select__tags-text, .el-select__selected-item, [class*="selected"]',
-  ).allTextContents().catch(() => []);
-  const normalized = selectedTexts
-    .flatMap((text) => text.split(/[\r\n,，]/))
-    .map((text) => text.replace(/[×x]\s*$/, '').replace(/\s+/g, ''))
-    .filter(Boolean);
-  return aliases.some((alias) => normalized.includes(alias.replace(/\s+/g, '')));
+  const normalized = await selectedControlTexts(combobox);
+  return aliases.some((alias) => normalized.some((text) => optionTextMatchesAlias(text, alias)));
 }
 
 async function frameHasCheckedOption(frame, aliases) {
-  const expected = aliases.map((alias) => alias.normalize('NFKC').replace(/\s+/g, ''));
-  return frame.locator('label.el-checkbox').evaluateAll((labels, names) => labels.some((label) => {
-    const text = (label.textContent || '').normalize('NFKC').replace(/\s+/g, '');
-    const checked = Boolean(label.querySelector('input[type="checkbox"]')?.checked)
-      || label.classList.contains('is-checked')
-      || Boolean(label.querySelector('.el-checkbox__input.is-checked'));
-    return names.includes(text) && checked;
+  const expected = aliases.map((alias) => normalizedOptionText(alias));
+  return frame.locator(OPTION_SELECTOR).evaluateAll((nodes, names) => nodes.some((node) => {
+    const text = (node.textContent || '').normalize('NFKC').replace(/\s+/g, '');
+    const classNames = String(node.className || '').split(/\s+/);
+    const checked = Boolean(node.querySelector('input[type="checkbox"]')?.checked)
+      || node.getAttribute('aria-checked') === 'true'
+      || node.getAttribute('aria-selected') === 'true'
+      || ['is-checked', 'is-selected', 'selected', 'checked', 'ant-select-item-option-selected']
+        .some((name) => classNames.includes(name))
+      || Boolean(node.querySelector('.el-checkbox__input.is-checked, [aria-checked="true"], [aria-selected="true"]'));
+    const matches = names.some((name) => text === name
+      || text.endsWith(`【${name}】`)
+      || text.endsWith(`[${name}]`));
+    return matches && checked;
   }), expected).catch(() => false);
 }
 
@@ -899,14 +996,13 @@ async function findCheckboxOptionWithScroll(frame, aliases, combobox) {
 }
 
 async function findCheckboxOptionAnyVisibility(frame, aliases, combobox) {
-  const expected = new Map(aliases.map((alias) => [alias.normalize('NFKC').replace(/\s+/g, ''), alias]));
   const popup = await controlledPopup(frame, combobox);
-  const candidates = popup ? popup.locator('label.el-checkbox') : frame.locator('label.el-checkbox');
+  const candidates = popup ? popup.locator(OPTION_SELECTOR) : frame.locator(OPTION_SELECTOR);
   const count = await candidates.count().catch(() => 0);
   for (let i = 0; i < count; i += 1) {
     const candidate = candidates.nth(i);
-    const text = (await candidate.textContent().catch(() => '')).normalize('NFKC').replace(/\s+/g, '');
-    const alias = expected.get(text);
+    const text = await candidate.textContent().catch(() => '');
+    const alias = aliases.find((item) => optionTextMatchesAlias(text, item));
     if (alias) return { option: candidate, alias };
   }
   return null;
@@ -1010,18 +1106,11 @@ async function verifyCheckboxOptions(frame, requiredOptions, combobox = null) {
     if (!selectedTag && !checkedInFrame && (!found || !await optionChecked(found.option))) missing.push(option.name);
   }
   if (missing.length) {
-    const root = combobox && await combobox.count()
-      ? combobox.locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " el-select ")][1]')
-      : null;
-    const selectedTexts = root && await root.count()
-      ? await root.locator('.el-tag, .el-select__tags-text, .el-select__selected-item, [class*="selected"]')
-        .allTextContents().catch(() => [])
-      : [];
     console.log(JSON.stringify({
       stage: 'checkbox-final-verification-failed',
       requiredNames: options.map((option) => option.name),
       missing,
-      selectedTexts,
+      ...(await selectionStateDiagnostic(frame, combobox)),
     }, null, 2));
     throw new Error(`主体最终校验未通过，未选中：${missing.join(', ')}`);
   }
@@ -1033,13 +1122,15 @@ async function clearOtherCheckedSubjectOptions(frame, allowedNames, combobox) {
     || await visiblePopupContainingOptions(frame, optionsToKeep);
   if (!popup) throw new Error('未找到同时包含三个指定主体的当前可见下拉，已停止以避免误选。');
   const options = popup.locator('label.el-checkbox');
-  const allowed = new Set(optionsToKeep.flatMap((option) => option.aliases).map((name) => name.replace(/\s+/g, '')));
+  const allowed = optionsToKeep.flatMap((option) => option.aliases);
   const count = await options.count();
   for (let i = 0; i < count; i += 1) {
     const option = options.nth(i);
     if (!await option.isVisible().catch(() => false)) continue;
-    const name = (await option.innerText().catch(() => '')).replace(/\s+/g, '');
-    if (!name || name === '全选' || allowed.has(name)) continue;
+    const name = await option.innerText().catch(() => '');
+    if (!normalizedOptionText(name)
+      || normalizedOptionText(name) === '全选'
+      || allowed.some((alias) => optionTextMatchesAlias(name, alias))) continue;
     if (await optionChecked(option)) {
       await option.click({ timeout: 1500 }).catch(() => option.evaluate((node) => node.click()));
       await frame.waitForTimeout(150);

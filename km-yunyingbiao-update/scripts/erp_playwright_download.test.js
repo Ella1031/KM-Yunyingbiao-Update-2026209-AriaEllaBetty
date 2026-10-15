@@ -139,6 +139,73 @@ async function main() {
   );
   await verifyCheckboxOptions(page.mainFrame(), ['KM一部一组'], tagSubject);
 
+  await page.setContent(`
+    <div class="ant-select ant-select-multiple">
+      <div class="ant-select-selection-overflow"></div>
+      <input id="ant-subject" role="combobox" aria-controls="ant-list" aria-expanded="true">
+    </div>
+    <div id="ant-list" class="ant-select-dropdown">
+      ${canonicalRequired.map((name) => `
+        <div role="option" class="ant-select-item ant-select-item-option" aria-selected="false" onclick="
+          this.setAttribute('aria-selected', 'true');
+          this.classList.add('ant-select-item-option-selected');
+          const tag=document.createElement('span');
+          tag.className='ant-select-selection-item';
+          tag.title='${name}';
+          tag.textContent='${name}';
+          document.querySelector('.ant-select-selection-overflow').appendChild(tag);
+        ">${name}</div>
+      `).join('')}
+    </div>
+  `);
+  const antSubject = page.locator('#ant-subject');
+  for (const name of canonicalRequired) await ensureCheckboxOption(page.mainFrame(), [name], antSubject);
+  await verifyCheckboxOptions(page.mainFrame(), canonicalRequired, antSubject);
+  assert.deepStrictEqual(
+    await page.locator('.ant-select-selection-item').allTextContents(),
+    canonicalRequired,
+  );
+
+  await page.setContent(`
+    <div class="el-select select-v2-multiple">
+      <div class="el-select__selection"></div>
+      <input id="coded-subject" class="el-select__input" role="combobox" aria-controls="coded-list" aria-expanded="true">
+    </div>
+    <ul id="coded-list" role="listbox" class="el-select-dropdown">
+      ${[
+    ['DP000422', 'KM一部一组'],
+    ['DP000423', 'KM一部二组'],
+    ['DP000425', 'KM一部三组'],
+    ['DP999999', '其他组'],
+  ].map(([code, name]) => `
+        <li role="option" aria-selected="false" class="el-select-dropdown__item" onclick="
+          const checked=this.getAttribute('aria-selected')!=='true';
+          this.setAttribute('aria-selected', String(checked));
+          this.classList.toggle('is-selected', checked);
+          this.querySelector('label').classList.toggle('is-checked', checked);
+          this.querySelector('input').checked=checked;
+          if (checked) {
+            const tag=document.createElement('span');
+            tag.className='el-tag';
+            tag.dataset.name='${name}';
+            tag.textContent='${code}【${name}】';
+            document.querySelector('.el-select__selection').appendChild(tag);
+          }
+        ">
+          <label class="el-checkbox"><input type="checkbox"><span>${code}【${name}】</span></label>
+        </li>
+      `).join('')}
+    </ul>
+  `);
+  const codedSubject = page.locator('#coded-subject');
+  for (const name of canonicalRequired) await ensureCheckboxOption(page.mainFrame(), [name], codedSubject);
+  await clearOtherCheckedSubjectOptions(page.mainFrame(), canonicalRequired, codedSubject);
+  await verifyCheckboxOptions(page.mainFrame(), canonicalRequired, codedSubject);
+  assert.deepStrictEqual(
+    await page.locator('#coded-list [role="option"]').evaluateAll((nodes) => nodes.map((node) => node.getAttribute('aria-selected'))),
+    ['true', 'true', 'true', 'false'],
+  );
+
   await page.setContent('<input id="value-filter" value="KM一部" role="combobox" aria-expanded="true">');
   const stableValueFilter = await openFilterSelect(page.mainFrame(), {
     placeholders: ['主体'],

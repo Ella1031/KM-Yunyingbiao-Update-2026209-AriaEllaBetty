@@ -51,7 +51,7 @@ Run this export only when the original Step2 condition reports one or more rows 
 Run this export together with the platform mapping export when the original Step2 condition requires mapping.
 
 1. Open `销售 -> Amazon销售面板`.
-2. In `小组`, select exactly the same three KM groups and verify all three checkbox states.
+2. In `小组`, select exactly the same three KM groups and verify all three checkbox states. The control may decorate each option with a system code, for example `DP000422【KM一部一组】`; accept that display only when the name inside `【】` exactly equals one of the three required names. Do not accept numeric aliases such as `1组`, `2组`, or `3组`.
 3. Click `搜索 -> 导出`.
 4. Open `常用操作 -> 导出记录`, reload the inner records page while waiting, and select only the current-run Amazon sales-panel row.
 5. Wait until `生成状态` is `已完成`, then click that row's `下载` and save it as `亚马逊销售面板.xlsx`. The export normally takes about five minutes; do not use an older completed row.
