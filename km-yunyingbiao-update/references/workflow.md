@@ -1,6 +1,6 @@
 # Step2 ERP运营表刷新流程
 
-This reference documents the ERP portion of the original two-step workflow. BI overseas-in-transit is Step1 and is documented in `bi-overseas-workflow.md`; the Step2 processor runs after Step1 for a complete refresh, or directly against an approved base workbook for an ERP-only run. A legacy `产品表-老三(含清货淘汰)` sheet is protected when present; a clean template may omit it.
+This reference documents the ERP portion of the original two-step workflow. BI overseas-in-transit is Step1 and is documented in `bi-overseas-workflow.md`. Authentication and downloads remain Step1 BI followed by Step2 ERP. For a complete workbook build, however, process ERP first and apply the fresh BI export last because ERP populates `新品期开售月` and can append SKUs required by the BI matcher. Use `scripts/build_full_refresh.py` to enforce that dependency-safe order. A legacy `产品表-老三(含清货淘汰)` sheet is protected when present; a clean template may omit it.
 
 ## 1. ERP登录与人工 handoff
 

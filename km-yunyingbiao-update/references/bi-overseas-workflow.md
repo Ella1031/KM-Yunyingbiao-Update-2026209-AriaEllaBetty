@@ -92,6 +92,8 @@ Do not modify any other operations-table value, formula, format, sheet, comment,
 
 Use `scripts/update_overseas_intransit.py`. Pass `--cleaned-bi-output` so the raw all-sheet export is never used directly for matching. The script must save both outputs to new paths and refuse to overwrite either input.
 
+For a complete refresh, do not treat the first BI-processed workbook as final before ERP processing. ERP may populate previously blank `新品期开售月` cells or append eligible SKUs. Use `scripts/build_full_refresh.py`, which processes ERP first and applies this fresh BI export last. A BI-only run may use `update_overseas_intransit.py` directly when the approved input workbook already contains current launch-month data.
+
 ```powershell
 python "$skillRoot\scripts\update_overseas_intransit.py" `
   --operations "C:\path\KM一部运营表.xlsx" `

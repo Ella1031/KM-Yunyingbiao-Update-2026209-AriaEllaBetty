@@ -687,9 +687,18 @@ def update_operations_sheet(
         cells = row_cells(row)
         sku = cell_text(cells.get(sku_col), strings).strip()
         launch = parse_date(cell_text(cells.get(launch_col), strings))
-        if not sku or launch is None:
+        if not sku:
+            continue
+        stats["operation_rows_with_sku"] += 1
+        if launch is None:
+            stats["operation_rows_missing_launch_month"] += 1
+            if sku in totals:
+                stats["bi_matched_rows_missing_launch_month"] += 1
             continue
         if not (lower_month <= first_of_month(launch) <= upper_month):
+            stats["operation_rows_outside_launch_window"] += 1
+            if sku in totals:
+                stats["bi_matched_rows_outside_launch_window"] += 1
             continue
         stats["eligible_operation_rows"] += 1
         if sku not in totals:
@@ -735,6 +744,11 @@ def update_operations_sheet(
         "launch_month_upper": upper_month.isoformat(),
         "arrival_date_upper": upper_date.isoformat(),
         **{key: stats[key] for key in (
+            "operation_rows_with_sku",
+            "operation_rows_missing_launch_month",
+            "bi_matched_rows_missing_launch_month",
+            "operation_rows_outside_launch_window",
+            "bi_matched_rows_outside_launch_window",
             "eligible_operation_rows",
             "matched_operation_rows",
             "unmatched_operation_rows",
