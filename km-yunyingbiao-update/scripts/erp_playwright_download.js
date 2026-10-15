@@ -888,6 +888,15 @@ async function visiblePopupContainingOptions(frame, requiredOptions) {
 async function findVisibleOption(frame, aliases, combobox = null) {
   const popup = await controlledPopup(frame, combobox);
   async function exactOptionIn(container) {
+    for (const alias of aliases) {
+      const exactTexts = container.getByText(alias, { exact: true });
+      const exactCount = await exactTexts.count().catch(() => 0);
+      for (let i = 0; i < exactCount; i += 1) {
+        const candidate = exactTexts.nth(i);
+        if (!await candidate.isVisible().catch(() => false)) continue;
+        return { option: await normalizeOption(candidate), alias };
+      }
+    }
     const candidates = container.locator(OPTION_SELECTOR);
     const count = await candidates.count().catch(() => 0);
     for (let i = 0; i < count; i += 1) {
@@ -929,6 +938,12 @@ async function findVisibleOption(frame, aliases, combobox = null) {
     }
   }
   return null;
+}
+
+async function singleOptionSelected(frame, aliases, combobox, option) {
+  if (await comboboxHasSelection(combobox, aliases)) return true;
+  if (option && await optionChecked(option)) return true;
+  return frameHasCheckedOption(frame, aliases);
 }
 
 async function ensureComboboxOpen(combobox) {
@@ -1145,12 +1160,25 @@ async function selectSingleOption(frame, aliases, combobox = null) {
     found = await findVisibleOption(frame, aliases, combobox);
   }
   if (!found) {
-    const options = await frame.locator('[role="option"], .el-select-dropdown__item, label.el-checkbox').allTextContents().catch(() => []);
-    console.log(JSON.stringify({ stage: 'option-diagnostic', expected: aliases, options: options.slice(0, 100) }, null, 2));
+    console.log(JSON.stringify({
+      stage: 'option-diagnostic',
+      expected: aliases,
+      ...(await selectionStateDiagnostic(frame, combobox)),
+    }, null, 2));
     throw new Error(`下拉中未找到选项：${aliases.join(' / ')}`);
   }
-  await found.option.click({ timeout: 1500 }).catch(() => found.option.evaluate((node) => node.click()));
+  await found.option.click({ force: true, noWaitAfter: true, timeout: 1500 })
+    .catch(() => found.option.evaluate((node) => node.click()));
   await frame.waitForTimeout(250);
+  if (!await singleOptionSelected(frame, aliases, combobox, found.option)) {
+    console.log(JSON.stringify({
+      stage: 'single-option-verification-failed',
+      expected: aliases,
+      matchedAlias: found.alias,
+      ...(await selectionStateDiagnostic(frame, combobox)),
+    }, null, 2));
+    throw new Error(`下拉选项点击后未确认选中：${aliases.join(' / ')}`);
+  }
   return found.alias;
 }
 

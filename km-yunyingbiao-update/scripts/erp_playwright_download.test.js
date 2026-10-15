@@ -48,7 +48,7 @@ async function main() {
   await page.setContent(`
     <input id="brand" role="combobox" aria-controls="brand-list" aria-expanded="true">
     <div id="unrelated" hidden><div role="option" onclick="this.dataset.selected='wrong'">Kemimoto</div></div>
-    <div id="brand-list"><div role="option" onclick="this.dataset.selected='yes'">Kemimoto</div></div>
+    <div id="brand-list"><div role="option" onclick="this.dataset.selected='yes'; this.setAttribute('aria-selected', 'true')">Kemimoto</div></div>
     <input id="subject" role="combobox" aria-expanded="true">
     <div id="subject-list" class="el-popper">
       <label class="el-checkbox"><input type="checkbox" checked><span>KM一部1组</span></label>
@@ -88,6 +88,35 @@ async function main() {
     'KM一部4组': false,
     '其他主体': false,
   });
+
+  await page.setContent(`
+    <div class="el-select">
+      <span class="el-select__selected-item"></span>
+      <input id="nested-brand" role="combobox" aria-controls="nested-brand-list" aria-expanded="true">
+    </div>
+    <div id="hidden-brand-list" hidden>
+      <div role="option" onclick="this.dataset.selected='wrong'">Kemimoto</div>
+    </div>
+    <div id="nested-brand-list" role="listbox" class="el-select-dropdown">
+      <div role="option" class="el-select-dropdown__item" aria-selected="false" onclick="
+        this.setAttribute('aria-selected', 'true');
+        this.classList.add('is-selected');
+        document.querySelector('.el-select__selected-item').textContent='Kemimoto';
+      ">
+        <span>Kemimoto</span><label>Kemimoto</label>
+      </div>
+      <div role="option" class="el-select-dropdown__item">Kemimoto Pro</div>
+      <div role="option" class="el-select-dropdown__item">全选</div>
+    </div>
+  `);
+  const nestedBrand = page.locator('#nested-brand');
+  await selectSingleOption(page.mainFrame(), ['Kemimoto'], nestedBrand);
+  assert.strictEqual(
+    await page.locator('#nested-brand-list [role="option"]').first().getAttribute('aria-selected'),
+    'true',
+  );
+  assert.strictEqual(await page.locator('#hidden-brand-list [role="option"]').getAttribute('data-selected'), null);
+  assert.strictEqual(await page.locator('.el-select__selected-item').innerText(), 'Kemimoto');
 
   await page.setContent(`
     <input id="element-subject" role="combobox" aria-controls="element-list" aria-expanded="true">

@@ -16,7 +16,7 @@ Pass `--workbook <current operations workbook>` during a complete run. The runne
 
 1. Open 产品模块 -> 新品成功率跟踪表（首单）.
 2. Select `平台SKU维度` and click `展开` when the extended filters are collapsed.
-3. In the 主体 multiselect, ensure exactly these three options are checked: `KM一部一组`, `KM一部二组`, and `KM一部三组`. These names must match exactly; do not substitute the distinct `KM一部1组`, `KM一部2组`, or `KM一部3组` options. Select brand `Kemimoto`, then click `搜索`.
+3. In the 主体 multiselect, ensure exactly these three options are checked: `KM一部一组`, `KM一部二组`, and `KM一部三组`. These names must match exactly; do not substitute the distinct `KM一部1组`, `KM一部2组`, or `KM一部3组` options. Select brand `Kemimoto`, then click `搜索`. After expanding the filters, the page can show two linked 品牌 controls. Select `Kemimoto` once in the controlled popup opened by the active combobox and verify that control is selected; the page synchronizes the other brand control automatically. Do not click both controls or treat the duplicate page text as two required selections.
 4. Verify all three主体 selections are checked before exporting; clicking matching text without checking its checkbox state is insufficient.
 5. Start Playwright's download listener, then click `导出` and capture the direct browser download. Do not navigate to 常用操作 or 导出记录 for this report.
 6. Save the file in the run's staging directory and confirm its modified time is later than the export click.
