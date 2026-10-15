@@ -118,6 +118,17 @@ def copy_row_style(sheet, source_row, target_row, max_col):
         sheet.row_dimensions[target_row].height = sheet.row_dimensions[source_row].height
 
 
+def last_content_row(sheet, first_data_row=3):
+    """Return the last row containing a value or formula, ignoring styled blanks."""
+    for row in range(sheet.max_row, first_data_row - 1, -1):
+        if any(
+            sheet.cell(row, column).value not in (None, "")
+            for column in range(1, sheet.max_column + 1)
+        ):
+            return row
+    return first_data_row - 1
+
+
 def append_tracking_skus(workbook, sheet, cols, tracking, legacy_name):
     """Apply the established new-SKU append rule and return append/exclusion counts."""
     main_skus = set()
@@ -140,6 +151,7 @@ def append_tracking_skus(workbook, sheet, cols, tracking, legacy_name):
 
     exclusions = main_skus | legacy_skus
     appended = 0
+    append_start_row = last_content_row(sheet) + 1
     yellow_fill = PatternFill(fill_type="solid", fgColor="FFFF00")
     for _, source in tracking.iterrows():
         platform_sku = clean(source["平台SKU"])
@@ -153,8 +165,9 @@ def append_tracking_skus(workbook, sheet, cols, tracking, legacy_name):
             or launch < datetime(2026, 1, 1).date()
         ):
             continue
-        target_row = sheet.max_row + 1
-        copy_row_style(sheet, target_row - 1, target_row, 43)
+        target_row = append_start_row + appended
+        if target_row > sheet.max_row:
+            copy_row_style(sheet, target_row - 1, target_row, 43)
         sheet.cell(target_row, cols[normalized("平台SKU")]).value = platform_sku
         sheet.cell(target_row, cols[normalized("仓库SKU")]).value = warehouse_sku or None
         sheet.cell(target_row, cols[normalized("平台SKU")]).fill = yellow_fill

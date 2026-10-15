@@ -80,7 +80,7 @@ Add a source row only when all conditions hold:
 - `预计开售时间` is parseable;
 - the parsed date is `2026-01-01` or later.
 
-Do not add blank, unparseable, 2024, or 2025 dates. Append eligible rows contiguously. Populate the source `平台SKU` and `仓库SKU` fields according to the established operation-table layout. Mark only the new `平台SKU` cell yellow.
+Do not add blank, unparseable, 2024, or 2025 dates. Append eligible rows contiguously immediately after the last row containing actual data. Ignore trailing rows that contain only formatting, borders, or row height when locating the append position; reuse those preformatted blank rows before extending the worksheet. Populate the source `平台SKU` and `仓库SKU` fields according to the established operation-table layout. Mark only the new `平台SKU` cell yellow.
 
 ## 7. 产品档案 matching
 
