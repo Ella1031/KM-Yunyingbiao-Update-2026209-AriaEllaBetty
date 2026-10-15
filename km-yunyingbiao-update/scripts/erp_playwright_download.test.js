@@ -9,14 +9,21 @@ const { chromium } = loadPlaywright();
 const {
   REPORTS,
   clearOtherCheckedSubjectOptions,
+  clickConfiguredExport,
   downloadGenericReport,
   ensureCheckboxOption,
+  installClientExportTrace,
+  isExcelResponseDiagnostic,
+  isWorkbookBuffer,
   isFreshExportRecord,
   isFreshProductRecord,
+  openFilterSelect,
   openReportFromMenuSearch,
   recordTimestamp,
+  retryTracedBlobDownload,
   selectedReportKinds,
   selectSingleOption,
+  saveResponseWorkbook,
   userActionRequiredEvent,
   verifyCheckboxOptions,
 } = require('./erp_playwright_download');
@@ -48,6 +55,7 @@ async function main() {
       <label class="el-checkbox"><input type="checkbox"><span>KM一部一组</span></label>
       <label class="el-checkbox"><input type="checkbox"><span>KM一部二组</span></label>
       <label class="el-checkbox"><input type="checkbox"><span>KM一部三组</span></label>
+      <label class="el-checkbox"><input type="checkbox" checked><span>KM一部4组</span></label>
       <label class="el-checkbox"><input type="checkbox" checked><span>其他主体</span></label>
     </div>
   `);
@@ -58,10 +66,15 @@ async function main() {
   assert.strictEqual(await page.locator('#unrelated [role="option"]').getAttribute('data-selected'), null);
 
   const subject = page.locator('#subject');
-  const required = ['KM一部一组', 'KM一部二组', 'KM一部三组'];
+  const required = [
+    { name: 'KM一部一组', aliases: ['KM一部一组'] },
+    { name: 'KM一部二组', aliases: ['KM一部二组'] },
+    { name: 'KM一部三组', aliases: ['KM一部三组'] },
+  ];
   await clearOtherCheckedSubjectOptions(page.mainFrame(), required, subject);
-  for (const name of required) await ensureCheckboxOption(page.mainFrame(), [name], subject);
+  for (const option of required) await ensureCheckboxOption(page.mainFrame(), option.aliases, subject);
   await clearOtherCheckedSubjectOptions(page.mainFrame(), required, subject);
+  await verifyCheckboxOptions(page.mainFrame(), required, subject);
 
   const state = await page.locator('#subject-list label').evaluateAll((labels) => Object.fromEntries(labels.map((label) => [
     label.innerText.trim(),
@@ -72,6 +85,7 @@ async function main() {
     'KM一部一组': true,
     'KM一部二组': true,
     'KM一部三组': true,
+    'KM一部4组': false,
     '其他主体': false,
   });
 
@@ -93,11 +107,50 @@ async function main() {
     </div>
   `);
   const elementSubject = page.locator('#element-subject');
-  for (const name of required) await ensureCheckboxOption(page.mainFrame(), [name], elementSubject);
-  await verifyCheckboxOptions(page.mainFrame(), required, elementSubject);
+  const canonicalRequired = required.map((option) => option.name);
+  for (const name of canonicalRequired) await ensureCheckboxOption(page.mainFrame(), [name], elementSubject);
+  await verifyCheckboxOptions(page.mainFrame(), canonicalRequired, elementSubject);
   assert.strictEqual(await page.locator('[data-name="already-selected"]').getAttribute('data-clicked'), null);
   assert.ok((await page.locator('[data-name="rerendered"]').getAttribute('class')).includes('is-checked'));
   assert.ok((await page.locator('[data-name="third"]').getAttribute('class')).includes('is-checked'));
+
+  await page.setContent(`
+    <div class="el-select">
+      <div class="el-select__tags"></div>
+      <input id="tag-subject" role="combobox" aria-controls="tag-list" aria-expanded="true">
+    </div>
+    <div id="tag-list" class="el-popper">
+      <label class="el-checkbox" onclick="
+        const tag=document.createElement('span');
+        tag.className='el-tag';
+        tag.textContent='KM一部一组';
+        document.querySelector('.el-select__tags').appendChild(tag);
+        this.remove();
+      ">
+        <span class="el-checkbox__input"><input type="checkbox"></span>
+        <span class="el-checkbox__label">KM一部一组</span>
+      </label>
+    </div>
+  `);
+  const tagSubject = page.locator('#tag-subject');
+  assert.strictEqual(
+    await ensureCheckboxOption(page.mainFrame(), ['KM一部一组'], tagSubject),
+    'KM一部一组',
+  );
+  await verifyCheckboxOptions(page.mainFrame(), ['KM一部一组'], tagSubject);
+
+  await page.setContent('<input id="value-filter" value="KM一部" role="combobox" aria-expanded="true">');
+  const stableValueFilter = await openFilterSelect(page.mainFrame(), {
+    placeholders: ['主体'],
+    values: ['KM一部'],
+  });
+  await stableValueFilter.fill('KM一部一组');
+  assert.strictEqual(await stableValueFilter.count(), 1);
+  assert.strictEqual(await stableValueFilter.inputValue(), 'KM一部一组');
+  await assert.rejects(
+    verifyCheckboxOptions(page.mainFrame(), ['KM一部一组'], stableValueFilter),
+    /主体最终校验未通过/,
+  );
 
   await page.setContent(`
     <input placeholder="输入并选择一个菜单" oninput="document.querySelector('#menu-result').hidden=false">
@@ -106,12 +159,25 @@ async function main() {
     </div>
     <section id="platform-report" hidden>
       <h1>我的平台SKU</h1>
-      <button>导出备货信息(取数)</button>
+      <div class="el-form-item__content">
+        <button data-name="filter-export">导出</button>
+      </div>
+      <div class="el-dropdown">
+        <button data-name="toolbar-export" aria-haspopup="menu" onclick="document.querySelector('#platform-export-menu').hidden=false">导出</button>
+      </div>
+      <ul id="platform-export-menu" hidden>
+        <li class="el-dropdown-menu__item" role="menuitem">导出(运营)</li>
+      </ul>
     </section>
   `);
   const platformSurface = await openReportFromMenuSearch(page, REPORTS.platform);
   assert.strictEqual(platformSurface.owner, page);
-  assert.ok((await platformSurface.frame.locator('body').innerText()).includes('导出备货信息(取数)'));
+  assert.strictEqual(
+    await clickConfiguredExport(platformSurface, REPORTS.platform),
+    '导出 -> 导出(运营)',
+  );
+  assert.strictEqual(await page.locator('[data-name="filter-export"]').getAttribute('aria-expanded'), null);
+  assert.strictEqual(await page.locator('#platform-export-menu').isVisible(), true);
 
   await page.setContent(`
     <input placeholder="输入并选择一个菜单" oninput="document.querySelector('#sales-menu').hidden=false">
@@ -127,7 +193,7 @@ async function main() {
         <label class="el-checkbox"><input type="checkbox"><span>KM一部二组</span></label>
         <label class="el-checkbox"><input type="checkbox"><span>KM一部三组</span></label>
       </div>
-      <button>搜索</button>
+      <input type="button" value="搜索">
       <a download="raw-sales.xlsx" href="data:application/octet-stream;base64,dGVzdCB3b3JrYm9vaw==">导出Excel</a>
       <span>导出</span>
     </section>
@@ -146,6 +212,52 @@ async function main() {
     REPORTS.sales.exportTexts = salesExportTexts;
     fs.rmSync(downloadDir, { recursive: true, force: true });
   }
+
+  assert.strictEqual(isExcelResponseDiagnostic({
+    contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    contentDisposition: '',
+  }), true);
+  assert.strictEqual(isExcelResponseDiagnostic({
+    contentType: 'application/octet-stream',
+    contentDisposition: 'attachment; filename="mapping.xlsx"',
+    url: 'https://erp.example/export',
+  }), true);
+  assert.strictEqual(isExcelResponseDiagnostic({
+    contentType: 'application/octet-stream',
+    contentDisposition: '',
+    url: 'https://erp.example/api/replenishment/export',
+  }), true);
+  assert.strictEqual(isExcelResponseDiagnostic({
+    contentType: 'application/json',
+    contentDisposition: '',
+    url: 'https://erp.example/api/export',
+  }), false);
+  assert.strictEqual(isWorkbookBuffer(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00])), true);
+  assert.strictEqual(isWorkbookBuffer(Buffer.from('{"ok":true}')), false);
+  const responseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'erp-response-save-test-'));
+  try {
+    const responsePath = saveResponseWorkbook(
+      Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00]),
+      responseDir,
+      Date.now(),
+      'platform',
+      '映射-备货信息-运营.xlsx',
+    );
+    assert.strictEqual(path.basename(responsePath), '映射-备货信息-运营.xlsx');
+    assert.strictEqual(fs.statSync(responsePath).size, 5);
+  } finally {
+    fs.rmSync(responseDir, { recursive: true, force: true });
+  }
+
+  await page.setContent('<main>client blob retry</main>');
+  await installClientExportTrace(page.mainFrame());
+  await page.evaluate(() => {
+    URL.createObjectURL(new Blob(['workbook bytes'], { type: 'application/octet-stream' }));
+  });
+  const blobRetry = await retryTracedBlobDownload(page.mainFrame(), page, '映射-备货信息-运营.xlsx');
+  assert.ok(blobRetry.download);
+  assert.strictEqual(blobRetry.download.suggestedFilename(), '映射-备货信息-运营.xlsx');
+  assert.ok(blobRetry.trace.blobCount >= 1);
 
   await browser.close();
 assert.ok(recordTimestamp('2026-10-13 14:44:52') > 0);

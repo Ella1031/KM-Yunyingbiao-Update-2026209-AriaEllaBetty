@@ -44,7 +44,7 @@ Run this export only when the original Step2 condition reports one or more rows 
 2. Click `重置`.
 3. In `主体`, select exactly `KM一部一组`, `KM一部二组`, and `KM一部三组`, then verify all three checkbox states.
 4. Click `搜索`.
-5. Click `导出 -> 导出（运营）`. If the current ERP page shows a confirmation dialog, click its `确认` or `确定` button. Capture the resulting direct download as `映射-备货信息-运营.xlsx`.
+5. Click `导出 -> 导出（运营）`. If the current ERP page shows a confirmation dialog, click its `确认` or `确定` button. The page submits `exportExcelByOperationType`; keep the same report and authenticated browser session open for up to ten minutes while the server builds the direct response. Capture the resulting direct download as `映射-备货信息-运营.xlsx`. Do not switch to `常用操作 -> 导出记录` for this report.
 
 ## 5. Export亚马逊销售面板
 
@@ -147,7 +147,7 @@ Run once without `--output` first to validate freshness, exact filters, required
 
 ## Automation boundary
 
-This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind step2-all --workbook <current-operations-workbook> --download-dir <new-empty-directory>` once. The script uses the fixed menu paths for `我的平台SKU` and `Amazon销售面板` only when the original Step2 condition requires those sources. It captures a direct download when available and otherwise follows only an export-record row created by the current run. It saves those reports as `映射-备货信息-运营.xlsx` and `亚马逊销售面板.xlsx`.
+This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind step2-all --workbook <current-operations-workbook> --download-dir <new-empty-directory>` once. The script uses the fixed menu paths for `我的平台SKU` and `Amazon销售面板` only when the original Step2 condition requires those sources. It waits for the current `我的平台SKU` direct-download request and follows only a current-run export-record row for `Amazon销售面板`. It saves those reports as `映射-备货信息-运营.xlsx` and `亚马逊销售面板.xlsx`.
 
 Before running the workbook processor, execute `scripts/validate_erp_step2_exports.py` with all four export paths and the recorded `run_start`. The validator rejects stale files, wrong tracking brand or subjects, missing source sheets, and missing required fields. Platform and sales exports may contain other groups because the processor filters their `小组` column to the three exact KM groups.
 

@@ -9,6 +9,13 @@ const readline = require('readline');
 const { spawnSync } = require('child_process');
 const { loadPlaywright } = require('./playwright_runtime');
 const { chromium } = loadPlaywright();
+let filterControlSequence = 0;
+
+const REQUIRED_KM_GROUPS = [
+  { name: 'KM一部一组', aliases: ['KM一部一组'] },
+  { name: 'KM一部二组', aliases: ['KM一部二组'] },
+  { name: 'KM一部三组', aliases: ['KM一部三组'] },
+];
 
 const ERP_URL = 'https://erp.issyzone.net:9999/system/index';
 const PRODUCT_URL = 'https://erp.issyzone.net:9999/master/product/product';
@@ -31,6 +38,7 @@ const REPORTS = {
     menuNames: ['我的平台SKU'],
     filterLabel: '主体',
     exportTexts: ['导出（运营）', '导出(运营)', '导出'],
+    nestedExport: true,
     recordTerms: ['replenishmentInfo', '导出备货信息', '映射-备货信息-运营'],
     outputName: '映射-备货信息-运营.xlsx',
     pageTerms: ['主体', '搜索', '导出'],
@@ -165,11 +173,18 @@ async function findMenuSearch(shellPage) {
   return null;
 }
 
+async function isFrameSurfaceVisible(frame) {
+  if (frame === frame.page().mainFrame()) return true;
+  const frameElement = await frame.frameElement().catch(() => null);
+  return Boolean(frameElement && await frameElement.isVisible().catch(() => false));
+}
+
 async function waitForReportSurface(context, config, timeoutMs = 60000, requireName = true) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (const owner of context.pages()) {
       for (const frame of owner.frames()) {
+        if (!await isFrameSurfaceVisible(frame)) continue;
         const body = await frame.locator('body').innerText().catch(() => '');
         const named = config.menuNames.some((name) => body.includes(name));
         const actionable = config.pageTerms.some((term) => body.includes(term))
@@ -205,7 +220,34 @@ async function openReportFromMenuSearch(shellPage, config) {
       await shellPage.keyboard.type(query);
     });
     await search.frame.waitForTimeout(800);
-    const candidate = await visibleExactTextInContext(context, config.menuNames);
+    let candidate = null;
+    const suggestionSelectors = [
+      '[role="option"]',
+      '.el-autocomplete-suggestion li',
+      '.el-select-dropdown__item',
+      '.el-menu-item',
+    ];
+    for (const selector of suggestionSelectors) {
+      for (const name of config.menuNames) {
+        const option = await firstVisible(search.frame.locator(selector).filter({ hasText: name }));
+        if (!option) continue;
+        const text = String(await option.innerText().catch(() => name)).trim();
+        if (config.menuNames.includes(text)) {
+          candidate = { owner: shellPage, frame: search.frame, locator: option, text };
+          break;
+        }
+      }
+      if (candidate) break;
+    }
+    if (!candidate) {
+      for (const name of config.menuNames) {
+        const exact = await firstVisible(search.frame.getByText(name, { exact: true }));
+        if (exact) {
+          candidate = { owner: shellPage, frame: search.frame, locator: exact, text: name };
+          break;
+        }
+      }
+    }
     if (!candidate) continue;
     await candidate.locator.click().catch(() => candidate.locator.evaluate((node) => node.click()));
     const surface = await waitForReportSurface(context, config, 30000);
@@ -254,6 +296,26 @@ async function openReportFromMenuPath(shellPage, config) {
 async function openConfiguredReport(shellPage, config) {
   if (config.menuPath) return openReportFromMenuPath(shellPage, config);
   return openReportFromMenuSearch(shellPage, config);
+}
+
+async function activateConfiguredReportTab(shellPage, config) {
+  const mainFrame = shellPage.mainFrame();
+  for (const name of config.menuNames) {
+    const tabs = mainFrame.locator('.tabTitle a, [class*="tabTitle"] a, [class*="tabs"] a').filter({ hasText: name });
+    const count = await tabs.count().catch(() => 0);
+    for (let i = 0; i < count; i += 1) {
+      const tab = tabs.nth(i);
+      if (!await tab.isVisible().catch(() => false)) continue;
+      const text = String(await tab.innerText().catch(() => '')).replace(/[\s×xX✕✖]+/g, '');
+      if (!text.includes(name.replace(/\s+/g, ''))) continue;
+      await tab.click({ noWaitAfter: true }).catch(() => tab.evaluate((node) => node.click()));
+      await shellPage.waitForTimeout(800);
+      break;
+    }
+  }
+  const surface = await waitForReportSurface(shellPage.context(), config, 10000, false);
+  if (!surface) throw new Error(`${config.name} 顶部页签激活后未找到可见报表页面。`);
+  return surface;
 }
 
 async function firstVisible(locator) {
@@ -597,12 +659,18 @@ async function waitForProductExportDownload(recordOwner, recordFrame, exportedAt
   });
 }
 
+async function stableFilterControl(frame, locator) {
+  const token = `codex-filter-${Date.now()}-${filterControlSequence += 1}`;
+  await locator.evaluate((node, value) => node.setAttribute('data-codex-filter-control', value), token);
+  return frame.locator(`[data-codex-filter-control="${token}"]`);
+}
+
 async function openFilterSelect(frame, { placeholders, values = [] }) {
   for (const placeholder of placeholders) {
     const input = await firstVisible(frame.locator(`input[placeholder*="${placeholder}"]`));
     if (input) {
       await input.click({ force: true });
-      return input;
+      return stableFilterControl(frame, input);
     }
     const text = await firstVisible(frame.getByText(placeholder, { exact: true }));
     if (text) {
@@ -611,10 +679,10 @@ async function openFilterSelect(frame, { placeholders, values = [] }) {
         const combobox = select.locator('input[role="combobox"]').first();
         if (await combobox.count()) {
           await combobox.click({ force: true });
-          return combobox;
+          return stableFilterControl(frame, combobox);
         }
         await select.click({ force: true });
-        return select;
+        return stableFilterControl(frame, select);
       }
     }
   }
@@ -622,7 +690,7 @@ async function openFilterSelect(frame, { placeholders, values = [] }) {
     const input = await firstVisible(frame.locator(`input[value="${value}"]`));
     if (input) {
       await input.click({ force: true });
-      return input;
+      return stableFilterControl(frame, input);
     }
     const text = await firstVisible(frame.getByText(value, { exact: true }));
     if (text) {
@@ -631,7 +699,7 @@ async function openFilterSelect(frame, { placeholders, values = [] }) {
       if (await combobox.count()) await combobox.click({ force: true });
       else if (await select.count()) await select.click({ force: true });
       else await text.click();
-      return await combobox.count() ? combobox : text;
+      return stableFilterControl(frame, await combobox.count() ? combobox : text);
     }
   }
   return null;
@@ -695,13 +763,48 @@ async function visiblePopupContaining(frame, requiredTexts) {
   return null;
 }
 
+function normalizeRequiredOptions(requiredOptions) {
+  return requiredOptions.map((item) => {
+    if (typeof item === 'string') return { name: item, aliases: [item] };
+    if (Array.isArray(item)) return { name: item[0], aliases: item };
+    return item;
+  });
+}
+
+async function visiblePopupContainingOptions(frame, requiredOptions) {
+  const options = normalizeRequiredOptions(requiredOptions);
+  const popups = frame.locator('.el-popper:visible, .el-select-dropdown:visible');
+  const count = await popups.count();
+  for (let i = 0; i < count; i += 1) {
+    const popup = popups.nth(i);
+    const text = (await popup.innerText().catch(() => '')).replace(/\s+/g, '');
+    if (options.every((option) => option.aliases.some((alias) => text.includes(alias.replace(/\s+/g, ''))))) {
+      return popup;
+    }
+  }
+  return null;
+}
+
 async function findVisibleOption(frame, aliases, combobox = null) {
   const popup = await controlledPopup(frame, combobox);
-  for (const alias of aliases) {
-    if (popup) {
-      const controlled = popup.getByText(alias, { exact: true }).first();
-      if (await controlled.count()) return { option: await normalizeOption(controlled), alias };
+  const normalizedAliases = new Map(aliases.map((alias) => [alias.replace(/\s+/g, ''), alias]));
+  async function exactOptionIn(container) {
+    const candidates = container.locator('label.el-checkbox, [role="option"], .el-select-dropdown__item');
+    const count = await candidates.count().catch(() => 0);
+    for (let i = 0; i < count; i += 1) {
+      const candidate = candidates.nth(i);
+      if (!await candidate.isVisible().catch(() => false)) continue;
+      const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, '');
+      const alias = normalizedAliases.get(text);
+      if (alias) return { option: await normalizeOption(candidate), alias };
     }
+    return null;
+  }
+  if (popup) {
+    const exact = await exactOptionIn(popup);
+    if (exact) return exact;
+  }
+  for (const alias of aliases) {
     const candidates = [
       frame.locator('.el-popper:visible').getByText(alias, { exact: true }),
       frame.locator('label.el-checkbox').filter({ hasText: alias }),
@@ -714,55 +817,229 @@ async function findVisibleOption(frame, aliases, combobox = null) {
       if (option) return { option: await normalizeOption(option), alias };
     }
   }
+  if (popup) {
+    const expected = new Set(aliases.map((alias) => alias.replace(/\s+/g, '')));
+    const labels = popup.locator('label.el-checkbox, [role="option"], .el-select-dropdown__item');
+    const count = await labels.count();
+    for (let i = 0; i < count; i += 1) {
+      const candidate = labels.nth(i);
+      if (!await candidate.isVisible().catch(() => false)) continue;
+      const text = (await candidate.innerText().catch(() => '')).replace(/\s+/g, '');
+      if (expected.has(text)) return { option: await normalizeOption(candidate), alias: aliases[0] };
+    }
+  }
   return null;
 }
 
 async function ensureComboboxOpen(combobox) {
+  if (!combobox || !await combobox.count()) return;
   if (await combobox.getAttribute('role').catch(() => null) !== 'combobox') return;
   if (await combobox.getAttribute('aria-expanded').catch(() => null) !== 'true') {
+    const filterValue = await combobox.inputValue().catch(() => '');
+    await combobox.click({ force: true, noWaitAfter: true }).catch(() => {});
+    await combobox.page().waitForTimeout(150);
+    if (filterValue && (await combobox.inputValue().catch(() => '')) !== filterValue) {
+      await combobox.fill(filterValue).catch(() => {});
+      await combobox.page().waitForTimeout(250);
+    }
     await combobox.press('ArrowDown');
     await combobox.page().waitForTimeout(300);
   }
 }
 
-async function ensureCheckboxOption(frame, aliases, combobox = null) {
-  let found = await findVisibleOption(frame, aliases, combobox);
-  if (!found) throw new Error(`主体下拉中未找到选项：${aliases.join(' / ')}`);
-  if (!await optionChecked(found.option)) {
-    const preferredTarget = found.option.locator('.el-checkbox__input, .el-checkbox__label').first();
-    const clickTarget = await preferredTarget.count() ? preferredTarget : found.option;
-    await clickTarget.click({ timeout: 1500 }).catch(() => found.option.evaluate((node) => node.click()));
-
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
-      await frame.waitForTimeout(100);
-      found = await findVisibleOption(frame, aliases, combobox);
-      if (found && await optionChecked(found.option)) break;
-    }
-  }
-  if (!found || !await optionChecked(found.option)) throw new Error(`主体选项未能勾选：${aliases[0]}`);
-  return found.alias;
+async function comboboxHasSelection(combobox, aliases) {
+  if (!combobox || !await combobox.count()) return false;
+  const root = combobox.locator(
+    'xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " el-select ")][1]',
+  );
+  if (!await root.count()) return false;
+  const selectedTexts = await root.locator(
+    '.el-tag, .el-select__tags-text, .el-select__selected-item, [class*="selected"]',
+  ).allTextContents().catch(() => []);
+  const normalized = selectedTexts
+    .flatMap((text) => text.split(/[\r\n,，]/))
+    .map((text) => text.replace(/[×x]\s*$/, '').replace(/\s+/g, ''))
+    .filter(Boolean);
+  return aliases.some((alias) => normalized.includes(alias.replace(/\s+/g, '')));
 }
 
-async function verifyCheckboxOptions(frame, requiredNames, combobox = null) {
-  const missing = [];
-  for (const name of requiredNames) {
-    const found = await findVisibleOption(frame, [name], combobox);
-    if (!found || !await optionChecked(found.option)) missing.push(name);
+async function frameHasCheckedOption(frame, aliases) {
+  const expected = aliases.map((alias) => alias.normalize('NFKC').replace(/\s+/g, ''));
+  return frame.locator('label.el-checkbox').evaluateAll((labels, names) => labels.some((label) => {
+    const text = (label.textContent || '').normalize('NFKC').replace(/\s+/g, '');
+    const checked = Boolean(label.querySelector('input[type="checkbox"]')?.checked)
+      || label.classList.contains('is-checked')
+      || Boolean(label.querySelector('.el-checkbox__input.is-checked'));
+    return names.includes(text) && checked;
+  }), expected).catch(() => false);
+}
+
+async function findCheckboxOptionWithScroll(frame, aliases, combobox) {
+  let found = await findVisibleOption(frame, aliases, combobox);
+  if (found) return found;
+  const popup = await controlledPopup(frame, combobox);
+  if (!popup) return null;
+  const candidates = [popup, ...Array.from({ length: Math.min(await popup.locator('*').count(), 160) }, (_, index) => popup.locator('*').nth(index))];
+  for (const scroller of candidates) {
+    const metrics = await scroller.evaluate((node) => ({
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+      overflowY: getComputedStyle(node).overflowY,
+    })).catch(() => null);
+    if (!metrics || metrics.clientHeight <= 0 || metrics.scrollHeight <= metrics.clientHeight + 5) continue;
+    const step = Math.max(80, Math.floor(metrics.clientHeight * 0.65));
+    for (let top = 0; top <= metrics.scrollHeight; top += step) {
+      await scroller.evaluate((node, value) => { node.scrollTop = value; }, top);
+      await frame.waitForTimeout(180);
+      found = await findVisibleOption(frame, aliases, combobox);
+      if (found) return found;
+    }
   }
-  if (missing.length) throw new Error(`主体最终校验未通过，未选中：${missing.join(', ')}`);
+  return null;
+}
+
+async function findCheckboxOptionAnyVisibility(frame, aliases, combobox) {
+  const expected = new Map(aliases.map((alias) => [alias.normalize('NFKC').replace(/\s+/g, ''), alias]));
+  const popup = await controlledPopup(frame, combobox);
+  const candidates = popup ? popup.locator('label.el-checkbox') : frame.locator('label.el-checkbox');
+  const count = await candidates.count().catch(() => 0);
+  for (let i = 0; i < count; i += 1) {
+    const candidate = candidates.nth(i);
+    const text = (await candidate.textContent().catch(() => '')).normalize('NFKC').replace(/\s+/g, '');
+    const alias = expected.get(text);
+    if (alias) return { option: candidate, alias };
+  }
+  return null;
+}
+
+async function ensureCheckboxOption(frame, aliases, combobox = null) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (combobox) {
+      await combobox.fill('KM一').catch(() => {});
+      await frame.waitForTimeout(250);
+    }
+    if (combobox) await ensureComboboxOpen(combobox);
+    let found = await findCheckboxOptionWithScroll(frame, aliases, combobox);
+    if (await comboboxHasSelection(combobox, aliases)) return aliases[0];
+    if (!found) {
+      found = await findCheckboxOptionAnyVisibility(frame, aliases, combobox);
+      if (!found) {
+        await frame.waitForTimeout(250);
+        continue;
+      }
+    }
+    if (await optionChecked(found.option)) return found.alias;
+    const checkboxLabel = found.option.locator(
+      'xpath=ancestor-or-self::label[contains(concat(" ", normalize-space(@class), " "), " el-checkbox ")][1]',
+    ).first();
+    const clickTargets = [checkboxLabel, found.option];
+    let clicked = false;
+    for (const target of clickTargets) {
+      if (!await target.count()) continue;
+      clicked = await target.click({ force: true, noWaitAfter: true, timeout: 1200 })
+        .then(() => true)
+        .catch(() => false);
+      if (clicked) break;
+    }
+    if (!clicked) {
+      await found.option.evaluate((node) => {
+        const label = node.matches('label') ? node : node.closest('label') || node;
+        const input = label.querySelector('input[type="checkbox"]');
+        if (input && !input.checked) input.click();
+        else label.click();
+      });
+    }
+
+    await frame.waitForTimeout(350);
+    const refreshedPopup = await controlledPopup(frame, combobox);
+    const refreshedChecked = refreshedPopup
+      ? await refreshedPopup.locator('label.el-checkbox').evaluateAll((labels, expected) => labels.some((label) => {
+        const text = (label.innerText || '').replace(/\s+/g, '');
+        const checked = Boolean(label.querySelector('input[type="checkbox"]')?.checked)
+          || label.classList.contains('is-checked');
+        return expected.includes(text) && checked;
+      }), aliases.map((alias) => alias.replace(/\s+/g, ''))).catch(() => false)
+      : false;
+    const frameChecked = await frameHasCheckedOption(frame, aliases);
+    if (refreshedChecked || frameChecked) return aliases[0];
+    if (await optionChecked(found.option)) return found.alias;
+    if (!(await comboboxHasSelection(combobox, aliases)) && !(await optionChecked(found.option))) {
+      await found.option.evaluate((node) => {
+        const label = node.matches('label') ? node : node.closest('label') || node;
+        const input = label.querySelector('input[type="checkbox"]');
+        if (input && !input.checked) {
+          input.click();
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }).catch(() => {});
+      await frame.waitForTimeout(350);
+    }
+    if (combobox) await ensureComboboxOpen(combobox);
+    found = await findCheckboxOptionWithScroll(frame, aliases, combobox);
+    if (await comboboxHasSelection(combobox, aliases)) return aliases[0];
+    if (found && (await comboboxHasSelection(combobox, aliases) || await optionChecked(found.option))) return found.alias;
+  }
+
+  const popup = await controlledPopup(frame, combobox);
+  const states = popup
+    ? await popup.locator('label.el-checkbox').evaluateAll((labels) => labels.map((label) => ({
+      text: (label.innerText || '').trim(),
+      checked: Boolean(label.querySelector('input[type="checkbox"]')?.checked),
+      class: label.className,
+    }))).catch(() => [])
+    : [];
+  if (await frameHasCheckedOption(frame, aliases)) return aliases[0];
+  console.log(JSON.stringify({
+    stage: 'checkbox-selection-failed',
+    expected: aliases,
+    ariaExpanded: combobox && await combobox.count()
+      ? await combobox.getAttribute('aria-expanded').catch(() => null)
+      : null,
+    states,
+  }, null, 2));
+  throw new Error(`主体选项未能勾选：${aliases[0]}`);
+}
+
+async function verifyCheckboxOptions(frame, requiredOptions, combobox = null) {
+  const options = normalizeRequiredOptions(requiredOptions);
+  const missing = [];
+  for (const option of options) {
+    const found = await findCheckboxOptionWithScroll(frame, option.aliases, combobox);
+    const selectedTag = await comboboxHasSelection(combobox, option.aliases);
+    const checkedInFrame = await frameHasCheckedOption(frame, option.aliases);
+    if (!selectedTag && !checkedInFrame && (!found || !await optionChecked(found.option))) missing.push(option.name);
+  }
+  if (missing.length) {
+    const root = combobox && await combobox.count()
+      ? combobox.locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " el-select ")][1]')
+      : null;
+    const selectedTexts = root && await root.count()
+      ? await root.locator('.el-tag, .el-select__tags-text, .el-select__selected-item, [class*="selected"]')
+        .allTextContents().catch(() => [])
+      : [];
+    console.log(JSON.stringify({
+      stage: 'checkbox-final-verification-failed',
+      requiredNames: options.map((option) => option.name),
+      missing,
+      selectedTexts,
+    }, null, 2));
+    throw new Error(`主体最终校验未通过，未选中：${missing.join(', ')}`);
+  }
 }
 
 async function clearOtherCheckedSubjectOptions(frame, allowedNames, combobox) {
-  const popup = await controlledPopup(frame, combobox) || await visiblePopupContaining(frame, allowedNames);
-  if (!popup) throw new Error('未找到同时包含三个指定中文主体名的当前可见下拉，已停止以避免误选。');
+  const optionsToKeep = normalizeRequiredOptions(allowedNames);
+  const popup = await controlledPopup(frame, combobox)
+    || await visiblePopupContainingOptions(frame, optionsToKeep);
+  if (!popup) throw new Error('未找到同时包含三个指定主体的当前可见下拉，已停止以避免误选。');
   const options = popup.locator('label.el-checkbox');
+  const allowed = new Set(optionsToKeep.flatMap((option) => option.aliases).map((name) => name.replace(/\s+/g, '')));
   const count = await options.count();
   for (let i = 0; i < count; i += 1) {
     const option = options.nth(i);
     if (!await option.isVisible().catch(() => false)) continue;
-    const name = (await option.innerText().catch(() => '')).trim();
-    if (!name || name === '全选' || allowedNames.includes(name)) continue;
+    const name = (await option.innerText().catch(() => '')).replace(/\s+/g, '');
+    if (!name || name === '全选' || allowed.has(name)) continue;
     if (await optionChecked(option)) {
       await option.click({ timeout: 1500 }).catch(() => option.evaluate((node) => node.click()));
       await frame.waitForTimeout(150);
@@ -845,17 +1122,20 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
     await frame.waitForTimeout(1000);
     done.push(await selectSingleOption(frame, ['Kemimoto'], brandSelect));
 
-    const subjectSelect = await openFilterSelect(frame, { placeholders: ['主体'], values: ['KM一部'] });
+    const subjectSelect = await openFilterSelect(frame, { placeholders: ['主体'], values: ['KM一', 'KM一部'] });
     if (!subjectSelect) {
       console.log(JSON.stringify({ stage: 'subject-control-diagnostic', ...(await filterControlDiagnostic(frame)) }, null, 2));
       throw new Error('未找到主体筛选下拉。');
     }
-    await subjectSelect.fill('KM一部').catch(() => {});
+    await subjectSelect.fill('KM一').catch(() => {});
     await ensureComboboxOpen(subjectSelect);
     await frame.waitForTimeout(300);
-    const requiredSubjects = ['KM一部一组', 'KM一部二组', 'KM一部三组'];
+    const requiredSubjects = REQUIRED_KM_GROUPS;
     await clearOtherCheckedSubjectOptions(frame, requiredSubjects, subjectSelect);
-    for (const subject of requiredSubjects) done.push(await ensureCheckboxOption(frame, [subject], subjectSelect));
+    for (const subject of requiredSubjects) {
+      await ensureCheckboxOption(frame, subject.aliases, subjectSelect);
+      done.push(subject.name);
+    }
     await clearOtherCheckedSubjectOptions(frame, requiredSubjects, subjectSelect);
     await verifyCheckboxOptions(frame, requiredSubjects, subjectSelect);
     await page.keyboard.press('Escape').catch(() => {});
@@ -888,22 +1168,419 @@ async function saveDownload(download, outputDir, exportedAt, kind, outputName = 
   return target;
 }
 
-async function clickConfiguredExport(context, config) {
+function safeDiagnosticUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return String(rawUrl).split('?')[0];
+  }
+}
+
+function responseDiagnostic(response) {
+  const request = response.request();
+  const headers = response.headers();
+  return {
+    method: request.method(),
+    resourceType: request.resourceType(),
+    status: response.status(),
+    url: safeDiagnosticUrl(response.url()),
+    contentType: headers['content-type'] || '',
+    contentDisposition: headers['content-disposition'] || '',
+    contentLength: headers['content-length'] || '',
+  };
+}
+
+function requestDiagnostic(request) {
+  return {
+    method: request.method(),
+    resourceType: request.resourceType(),
+    url: safeDiagnosticUrl(request.url()),
+    postDataSize: Buffer.byteLength(request.postData() || ''),
+  };
+}
+
+function isExcelResponseDiagnostic(diagnostic) {
+  const contentType = diagnostic.contentType.toLowerCase();
+  const disposition = diagnostic.contentDisposition.toLowerCase();
+  const exportLikeUrl = /(?:export|download|excel|file|replenish)/i.test(diagnostic.url || '');
+  return (
+    contentType.includes('spreadsheetml')
+    || contentType.includes('ms-excel')
+    || disposition.includes('.xlsx')
+    || disposition.includes('.xls')
+    || (contentType.includes('octet-stream') && exportLikeUrl)
+  );
+}
+
+function isWorkbookBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return false;
+  const zip = buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04;
+  const ole = buffer[0] === 0xd0 && buffer[1] === 0xcf && buffer[2] === 0x11 && buffer[3] === 0xe0;
+  return zip || ole;
+}
+
+function saveResponseWorkbook(buffer, outputDir, exportedAt, kind, outputName) {
+  if (!isWorkbookBuffer(buffer)) throw new Error('导出响应不是有效的 XLSX/XLS 工作簿。');
+  const target = path.join(outputDir, outputName);
+  if (fs.existsSync(target)) {
+    throw new Error(`下载目录已存在 ${outputName}，请使用新的运行目录，避免混入旧导出。`);
+  }
+  fs.writeFileSync(target, buffer);
+  const saved = fs.statSync(target);
+  if (saved.mtimeMs < exportedAt - 2000) throw new Error(`下载文件时间早于本次导出：${target}`);
+  console.log(JSON.stringify({
+    stage: 'downloaded',
+    kind,
+    path: target,
+    suggestedFilename: outputName,
+    source: 'excel-response-body',
+  }, null, 2));
+  return target;
+}
+
+function createExportResponseMonitor(context, owners, startedAt) {
+  const diagnostics = { requests: [], responses: [], consoleErrors: [], pageErrors: [] };
+  let resolveWorkbook;
+  const workbookPromise = new Promise((resolve) => { resolveWorkbook = resolve; });
+  let workbookResolved = false;
+  let exportRequestLogged = false;
+  const listeners = [];
+
+  const requestListener = (request) => {
+    if (Date.now() < startedAt) return;
+    const diagnostic = requestDiagnostic(request);
+    if (!['xhr', 'fetch', 'document'].includes(diagnostic.resourceType)) return;
+    diagnostics.requests.push(diagnostic);
+    if (diagnostics.requests.length > 100) diagnostics.requests.shift();
+    if (!exportRequestLogged && diagnostic.url.includes('/exportExcelByOperationType')) {
+      exportRequestLogged = true;
+      console.log(JSON.stringify({ stage: 'platform-export-request-started', ...diagnostic }, null, 2));
+    }
+  };
+  const responseListener = async (response) => {
+    if (Date.now() < startedAt) return;
+    const diagnostic = responseDiagnostic(response);
+    if (!['xhr', 'fetch', 'document'].includes(diagnostic.resourceType)) return;
+    diagnostics.responses.push(diagnostic);
+    if (diagnostics.responses.length > 100) diagnostics.responses.shift();
+    const isPlatformExportResponse = diagnostic.url.includes('/exportExcelByOperationType');
+    if ((!isExcelResponseDiagnostic(diagnostic) && !isPlatformExportResponse) || workbookResolved) return;
+    const body = await response.body().catch(() => null);
+    if (!isWorkbookBuffer(body) || workbookResolved) return;
+    workbookResolved = true;
+    resolveWorkbook({ body, diagnostic });
+  };
+  context.on('request', requestListener);
+  context.on('response', responseListener);
+  listeners.push({ owner: context, event: 'request', listener: requestListener });
+  listeners.push({ owner: context, event: 'response', listener: responseListener });
+
+  const attachPage = (owner) => {
+    const consoleListener = (message) => {
+      if (Date.now() < startedAt || !['error', 'warning'].includes(message.type())) return;
+      diagnostics.consoleErrors.push({ type: message.type(), text: message.text().slice(0, 1000) });
+      if (diagnostics.consoleErrors.length > 30) diagnostics.consoleErrors.shift();
+    };
+    const pageErrorListener = (error) => {
+      if (Date.now() < startedAt) return;
+      diagnostics.pageErrors.push(String(error.message || error).slice(0, 1000));
+      if (diagnostics.pageErrors.length > 30) diagnostics.pageErrors.shift();
+    };
+    owner.on('console', consoleListener);
+    owner.on('pageerror', pageErrorListener);
+    listeners.push({ owner, event: 'console', listener: consoleListener });
+    listeners.push({ owner, event: 'pageerror', listener: pageErrorListener });
+  };
+  for (const owner of owners) attachPage(owner);
+  const pageListener = (owner) => attachPage(owner);
+  context.on('page', pageListener);
+  listeners.push({ owner: context, event: 'page', listener: pageListener });
+
+  return {
+    diagnostics,
+    workbookPromise,
+    stop() {
+      for (const { owner, event, listener } of listeners) owner.off(event, listener);
+      if (!workbookResolved) resolveWorkbook(null);
+    },
+  };
+}
+
+async function installClientExportTrace(frame) {
+  await frame.evaluate(() => {
+    if (window.__codexExportTraceInstalled) return;
+    window.__codexExportTraceInstalled = true;
+    window.__codexExportTrace = [];
+    window.__codexExportBlobs = [];
+    const trace = (event) => window.__codexExportTrace.push({ at: Date.now(), ...event });
+    const originalCreateObjectURL = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (value) => {
+      if (value instanceof Blob) {
+        window.__codexExportBlobs.push(value);
+        trace({ type: 'create-object-url', mime: value.type || '', size: value.size });
+      }
+      return originalCreateObjectURL(value);
+    };
+    const originalAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function tracedAnchorClick() {
+      trace({
+        type: 'anchor-click',
+        download: this.download || '',
+        href: String(this.href || '').split('?')[0].slice(0, 300),
+      });
+      return originalAnchorClick.call(this);
+    };
+    const originalOpen = window.open;
+    window.open = function tracedWindowOpen(url, ...args) {
+      trace({ type: 'window-open', url: String(url || '').split('?')[0].slice(0, 300) });
+      return originalOpen.call(this, url, ...args);
+    };
+  }).catch(() => {});
+}
+
+async function clientExportTrace(frame) {
+  return frame.evaluate(() => ({
+    events: Array.isArray(window.__codexExportTrace) ? window.__codexExportTrace.slice(-50) : [],
+    blobCount: Array.isArray(window.__codexExportBlobs) ? window.__codexExportBlobs.length : 0,
+  })).catch(() => ({ events: [], blobCount: 0 }));
+}
+
+async function retryTracedBlobDownload(frame, owner, outputName) {
+  const trace = await clientExportTrace(frame);
+  if (!trace.blobCount) return { download: null, trace };
+  const downloadPromise = owner.waitForEvent('download', { timeout: 20000 }).catch(() => null);
+  await frame.evaluate((name) => {
+    const blob = window.__codexExportBlobs?.[window.__codexExportBlobs.length - 1];
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = name;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    setTimeout(() => {
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }, outputName);
+  return { download: await downloadPromise, trace: await clientExportTrace(frame) };
+}
+
+async function collectExportFeedback(frame) {
+  const selectors = [
+    '.el-message',
+    '.el-notification',
+    '[role="alert"]',
+    '.ant-message-notice',
+    '.ant-notification-notice',
+    '.toast',
+  ];
+  const feedback = [];
+  for (const selector of selectors) {
+    const items = frame.locator(selector);
+    const count = Math.min(await items.count().catch(() => 0), 20);
+    for (let i = 0; i < count; i += 1) {
+      const item = items.nth(i);
+      if (!await item.isVisible().catch(() => false)) continue;
+      const text = (await item.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+      if (text && !feedback.includes(text)) feedback.push(text);
+    }
+  }
+  return feedback.slice(0, 20);
+}
+
+async function visibleNormalizedAction(frames, texts) {
+  const expected = new Set(texts.map((text) => text.replace(/\s+/g, '')));
+  for (const frame of frames) {
+    const actions = frame.locator(
+      'button, a, input[type="button"], input[type="submit"], [role="button"], [role="menuitem"], .el-dropdown-menu__item, .el-button',
+    );
+    const count = await actions.count();
+    for (let i = 0; i < count; i += 1) {
+      const action = actions.nth(i);
+      if (!await action.isVisible().catch(() => false)) continue;
+      const text = String((
+        await action.innerText().catch(() => '')
+        || await action.getAttribute('value').catch(() => '')
+        || await action.getAttribute('aria-label').catch(() => '')
+        || ''
+      )).replace(/\s+/g, '');
+      if (expected.has(text)) return { frame, locator: action, text };
+    }
+    for (const expectedText of texts) {
+      const textMatches = frame.getByText(expectedText, { exact: true });
+      const matchCount = await textMatches.count().catch(() => 0);
+      for (let i = 0; i < matchCount; i += 1) {
+        const match = textMatches.nth(i);
+        if (!await match.isVisible().catch(() => false)) continue;
+        const text = String(await match.innerText().catch(() => expectedText)).replace(/\s+/g, '');
+        if (expected.has(text)) {
+          const clickable = match.locator(
+            'xpath=ancestor-or-self::*[self::button or self::a or @role="button" or @role="menuitem" or contains(concat(" ", normalize-space(@class), " "), " el-button ") or contains(@class, "dropdown")][1]',
+          ).first();
+          return { frame, locator: await clickable.count() ? clickable : match, text };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function findNestedExportTrigger(frames) {
+  let best = null;
+  for (const frame of frames) {
+    const toolbarButtons = frame.locator([
+      '.table-btn button[aria-haspopup="menu"]',
+      '.table-btn [role="button"][aria-haspopup="menu"]',
+    ].join(', '));
+    const toolbarCount = await toolbarButtons.count().catch(() => 0);
+    for (let i = 0; i < toolbarCount; i += 1) {
+      const button = toolbarButtons.nth(i);
+      if (!await button.isVisible().catch(() => false)) continue;
+      const text = String(await button.innerText().catch(() => '')).replace(/\s+/g, '');
+      if (text === '导出') return { frame, locator: button, text, score: 1000 + i };
+    }
+
+    const preferred = frame.locator([
+      'button[aria-haspopup="menu"]',
+      '[role="button"][aria-haspopup="menu"]',
+      '.el-dropdown button',
+    ].join(', ')).filter({ hasText: '导出' });
+    const preferredCount = await preferred.count().catch(() => 0);
+    for (let i = 0; i < preferredCount; i += 1) {
+      const button = preferred.nth(i);
+      if (!await button.isVisible().catch(() => false)) continue;
+      const text = String(await button.innerText().catch(() => '')).replace(/\s+/g, '');
+      if (text === '导出') return { frame, locator: button, text, score: 950 + i };
+    }
+
+    const labels = frame.getByText('导出', { exact: true });
+    const labelCount = await labels.count().catch(() => 0);
+    for (let i = 0; i < labelCount; i += 1) {
+      const label = labels.nth(i);
+      if (!await label.isVisible().catch(() => false)) continue;
+      const button = label.locator(
+        'xpath=ancestor-or-self::*[self::button or @role="button" or @aria-haspopup="menu"][1]',
+      ).first();
+      if (!await button.count().catch(() => 0)) continue;
+      const popup = await button.getAttribute('aria-haspopup').catch(() => null);
+      const dropdown = await button.evaluate((node) => Boolean(node.closest('.table-btn, .el-dropdown, [class*="dropdown"]'))).catch(() => false);
+      if (popup === 'menu' || dropdown) return { frame, locator: button, text: '导出', score: 900 + i };
+    }
+
+    const buttons = frame.locator('button, [role="button"]');
+    const count = await buttons.count().catch(() => 0);
+    for (let i = 0; i < count; i += 1) {
+      const button = buttons.nth(i);
+      const text = String(await button.innerText().catch(() => '')).replace(/\s+/g, '');
+      if (text !== '导出') continue;
+      const score = await button.evaluate((node, index) => {
+        const ancestor = node.closest('[class*="dropdown"], [aria-haspopup="menu"], [aria-haspopup="listbox"]');
+        const hasArrow = Boolean(node.querySelector('i, svg, [class*="arrow"], [class*="caret"]'));
+        const popup = node.getAttribute('aria-haspopup');
+        return (ancestor ? 100 : 0) + (hasArrow ? 50 : 0) + (popup ? 25 : 0) + index;
+      }, i).catch(() => i);
+      if (!best || score >= best.score) best = { frame, locator: button, text, score };
+    }
+  }
+  return best;
+}
+
+async function clickConfiguredExport(surface, config) {
+  const ownerFrames = [surface.frame];
   const specificTexts = config.exportTexts.filter((text) => text !== '导出');
-  let action = await visibleExactTextInContext(context, specificTexts);
-  if (action) {
+  let action = config.nestedExport ? null : await visibleNormalizedAction(ownerFrames, specificTexts);
+  if (!config.nestedExport && action) {
     await action.locator.click({ noWaitAfter: true }).catch(() => action.locator.evaluate((node) => node.click()));
     return action.text;
   }
 
-  const trigger = await visibleExactTextInContext(context, ['导出']);
+  const trigger = config.nestedExport
+    ? await findNestedExportTrigger(ownerFrames)
+    : await visibleNormalizedAction(ownerFrames, ['导出']);
   if (!trigger) throw new Error(`${config.name} 页面未找到导出操作。`);
+  await trigger.locator.hover().catch(() => {});
   await trigger.locator.click({ noWaitAfter: true }).catch(() => trigger.locator.evaluate((node) => node.click()));
-  await trigger.owner.waitForTimeout(600);
-  action = await visibleExactTextInContext(context, specificTexts);
+  console.log(JSON.stringify({ stage: 'export-trigger-clicked', kind: config.name, action: trigger.text }, null, 2));
+  await surface.owner.waitForTimeout(1200);
+  action = await visibleNormalizedAction(ownerFrames, specificTexts);
+  if (!action && config.nestedExport) {
+    const innerArrow = trigger.locator.locator('i:visible, svg:visible, [class*="arrow"]:visible, [class*="caret"]:visible').last();
+    if (await innerArrow.count()) {
+      await innerArrow.hover().catch(() => {});
+      await innerArrow.click({ force: true, noWaitAfter: true }).catch(() => innerArrow.evaluate((node) => node.click()));
+      await surface.owner.waitForTimeout(1200);
+      action = await visibleNormalizedAction(ownerFrames, specificTexts);
+    }
+  }
+  if (!action && config.nestedExport) {
+    const dropdownRoot = trigger.locator.locator(
+      'xpath=ancestor::*[contains(@class, "el-dropdown") or contains(@class, "button-group") or contains(@class, "dropdown")][1]',
+    ).first();
+    if (await dropdownRoot.count()) {
+      const caretButtons = dropdownRoot.locator(
+        'button:visible, [role="button"]:visible, .el-dropdown__caret-button:visible, [class*="caret"]:visible',
+      );
+      const caretCount = await caretButtons.count().catch(() => 0);
+      if (caretCount > 1) {
+        const caret = caretButtons.nth(caretCount - 1);
+        await caret.hover().catch(() => {});
+        await caret.click({ force: true, noWaitAfter: true }).catch(() => caret.evaluate((node) => node.click()));
+        await surface.owner.waitForTimeout(1200);
+        action = await visibleNormalizedAction(ownerFrames, specificTexts);
+      }
+      if (!action) {
+        const arrow = dropdownRoot.locator('i:visible, svg:visible, [class*="arrow"]:visible, [class*="caret"]:visible').last();
+        if (await arrow.count()) {
+          await arrow.click({ force: true, noWaitAfter: true }).catch(() => arrow.evaluate((node) => node.click()));
+          await surface.owner.waitForTimeout(1200);
+          action = await visibleNormalizedAction(ownerFrames, specificTexts);
+        }
+      }
+    }
+  }
+  if (!action && config.nestedExport) {
+    const box = await trigger.locator.boundingBox().catch(() => null);
+    if (box && box.width > 12) {
+      await trigger.locator.click({
+        force: true,
+        noWaitAfter: true,
+        position: { x: Math.max(2, box.width - 8), y: Math.max(2, box.height / 2) },
+      }).catch(() => {});
+      await surface.owner.waitForTimeout(1200);
+      action = await visibleNormalizedAction(ownerFrames, specificTexts);
+    }
+  }
+  if (!action && config.nestedExport) {
+    await trigger.locator.hover().catch(() => {});
+    await trigger.locator.dispatchEvent('mouseenter').catch(() => {});
+    await trigger.locator.press('ArrowDown').catch(() => {});
+    await surface.owner.waitForTimeout(1200);
+    action = await visibleNormalizedAction(ownerFrames, specificTexts);
+  }
   if (action) {
     await action.locator.click({ noWaitAfter: true }).catch(() => action.locator.evaluate((node) => node.click()));
+    console.log(JSON.stringify({ stage: 'export-option-clicked', kind: config.name, action: action.text }, null, 2));
     return `${trigger.text} -> ${action.text}`;
+  }
+  if (specificTexts.length) {
+    const visibleActions = [];
+    for (const frame of ownerFrames) {
+      visibleActions.push(...await frame.locator(
+        'button:visible, a:visible, [role="menuitem"]:visible, .el-dropdown-menu__item:visible',
+      ).allTextContents().catch(() => []));
+    }
+    console.log(JSON.stringify({
+      stage: 'export-menu-diagnostic',
+      kind: config.name,
+      expected: specificTexts,
+      triggerHtml: await trigger.locator.evaluate((node) => node.outerHTML).catch(() => ''),
+      triggerParentHtml: await trigger.locator.evaluate((node) => node.parentElement?.outerHTML || '').catch(() => ''),
+      visibleActions: visibleActions.map((text) => text.trim()).filter(Boolean).slice(0, 100),
+    }, null, 2));
+    throw new Error(`${config.name} 点击“导出”后未找到指定的二级导出项。`);
   }
   return trigger.text;
 }
@@ -918,7 +1595,7 @@ async function applyGenericGroupFilter(surface, config) {
 
   const groupSelect = await openFilterSelect(frame, {
     placeholders: [config.filterLabel],
-    values: ['KM一部'],
+    values: ['KM一', 'KM一部'],
   });
   if (!groupSelect) {
     console.log(JSON.stringify({
@@ -929,51 +1606,120 @@ async function applyGenericGroupFilter(surface, config) {
     }, null, 2));
     throw new Error(`${config.name} 未找到“${config.filterLabel}”筛选框。`);
   }
-  await groupSelect.fill('KM一部').catch(() => {});
+  await groupSelect.fill('KM一').catch(() => {});
   await ensureComboboxOpen(groupSelect);
   await frame.waitForTimeout(300);
-  const requiredGroups = ['KM一部一组', 'KM一部二组', 'KM一部三组'];
+  const requiredGroups = REQUIRED_KM_GROUPS;
   await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
-  for (const group of requiredGroups) await ensureCheckboxOption(frame, [group], groupSelect);
+  for (const group of requiredGroups) await ensureCheckboxOption(frame, group.aliases, groupSelect);
   await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
   await verifyCheckboxOptions(frame, requiredGroups, groupSelect);
   await surface.owner.keyboard.press('Escape').catch(() => {});
 
-  const search = await firstVisible(frame.getByText('搜索', { exact: true }));
-  if (!search) throw new Error(`${config.name} 筛选完成，但未找到“搜索”按钮。`);
-  await search.click({ noWaitAfter: true }).catch(() => search.evaluate((node) => node.click()));
+  const searchFrames = [frame, ...surface.owner.frames().filter((item) => item !== frame)];
+  const search = await visibleNormalizedAction(searchFrames, ['搜索', '查询']);
+  if (!search) throw new Error(`${config.name} 筛选完成，但未找到“搜索/查询”按钮。`);
+  await search.locator.click({ noWaitAfter: true }).catch(() => search.locator.evaluate((node) => node.click()));
   await frame.waitForTimeout(2500);
   console.log(JSON.stringify({
     stage: 'filters',
     kind: config.name,
     reset: Boolean(reset),
     field: config.filterLabel,
-    groups: requiredGroups,
+    groups: requiredGroups.map((group) => group.name),
   }, null, 2));
 }
 
 async function downloadGenericReport(context, shellPage, outputDir, kind) {
   const config = REPORTS[kind];
-  const surface = await openConfiguredReport(shellPage, config);
+  let surface = await openConfiguredReport(shellPage, config);
   await applyGenericGroupFilter(surface, config);
+  surface = await activateConfiguredReportTab(shellPage, config);
   const exportedAt = Date.now();
   const downloadOwners = [...new Set([surface.owner, ...context.pages()])];
-  const directPromises = downloadOwners.map((owner) => owner.waitForEvent('download', { timeout: 12000 }).catch(() => null));
-  const action = await clickConfiguredExport(context, config);
+  const responseMonitor = createExportResponseMonitor(context, downloadOwners, exportedAt);
+  if (kind === 'platform') await installClientExportTrace(surface.frame);
+  const directDownloadPromise = Promise.race(downloadOwners.map((owner) => (
+    owner.waitForEvent('download', { timeout: 0 }).catch(() => new Promise(() => {}))
+  )));
+  const action = await clickConfiguredExport(surface, config);
+  console.log(JSON.stringify({ stage: 'export-action-clicked', kind, action }, null, 2));
   let download = await Promise.race([
-    ...directPromises,
+    directDownloadPromise,
     surface.owner.waitForTimeout(3000).then(() => null),
   ]);
   if (kind === 'platform' && !download) {
-    const confirm = await visibleNormalizedButtonInContext(context, ['确认', '确定'], 8000);
+    const confirm = await visibleNormalizedAction([surface.frame], ['确认', '确定']);
     if (confirm) {
+      const dialog = confirm.locator.locator(
+        'xpath=ancestor::*[@role="dialog" or contains(@class, "el-message-box") or contains(@class, "el-dialog")][1]',
+      ).first();
+      console.log(JSON.stringify({
+        stage: 'export-confirm-diagnostic',
+        kind,
+        enabled: await confirm.locator.isEnabled().catch(() => null),
+        buttonHtml: (await confirm.locator.evaluate((node) => node.outerHTML).catch(() => '')).slice(0, 1000),
+        dialogText: (await dialog.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 1000),
+      }, null, 2));
       await confirm.locator.click({ noWaitAfter: true }).catch(() => confirm.locator.evaluate((node) => node.click()));
+      await surface.owner.waitForTimeout(750);
+      const confirmStillVisible = await confirm.locator.isVisible().catch(() => false);
+      if (confirmStillVisible) {
+        await confirm.locator.click({ force: true, noWaitAfter: true }).catch(() => {});
+        await surface.owner.waitForTimeout(750);
+      }
+      console.log(JSON.stringify({ stage: 'export-confirm-clicked', kind, action: confirm.text }, null, 2));
+      console.log(JSON.stringify({
+        stage: 'export-confirm-result',
+        kind,
+        dismissed: !await confirm.locator.isVisible().catch(() => false),
+        feedback: await collectExportFeedback(surface.frame),
+      }, null, 2));
+      const result = await Promise.race([
+        directDownloadPromise,
+        responseMonitor.workbookPromise,
+        surface.owner.waitForTimeout(600000).then(() => null),
+      ]);
+      if (result && result.body) {
+        responseMonitor.stop();
+        console.log(JSON.stringify({ stage: 'export-response-workbook', kind, ...result.diagnostic }, null, 2));
+        return saveResponseWorkbook(result.body, outputDir, exportedAt, kind, config.outputName);
+      }
+      download = result;
+      if (!download) {
+        const retried = await retryTracedBlobDownload(surface.frame, surface.owner, config.outputName);
+        download = retried.download;
+        console.log(JSON.stringify({ stage: 'client-export-trace', kind, retried: Boolean(download), ...retried.trace }, null, 2));
+      }
     } else {
       console.log(JSON.stringify({ stage: 'export-confirm-not-shown', kind, action }, null, 2));
+      const result = await Promise.race([
+        directDownloadPromise,
+        responseMonitor.workbookPromise,
+        surface.owner.waitForTimeout(600000).then(() => null),
+      ]);
+      if (result && result.body) {
+        responseMonitor.stop();
+        console.log(JSON.stringify({ stage: 'export-response-workbook', kind, ...result.diagnostic }, null, 2));
+        return saveResponseWorkbook(result.body, outputDir, exportedAt, kind, config.outputName);
+      }
+      download = result;
     }
   }
-  download = download || (await Promise.all(directPromises)).find(Boolean) || null;
+  if (download) responseMonitor.stop();
+  if (!download && kind === 'platform') {
+    const feedback = await collectExportFeedback(surface.frame);
+    console.log(JSON.stringify({
+      stage: 'platform-export-diagnostic',
+      feedback,
+      clientTrace: await clientExportTrace(surface.frame),
+      ...responseMonitor.diagnostics,
+    }, null, 2));
+    responseMonitor.stop();
+    throw new Error('我的平台SKU已确认导出，但未收到下载事件或有效 Excel 响应。请查看 platform-export-diagnostic。');
+  }
   if (!download) {
+    responseMonitor.stop();
     const records = await openExportRecords(shellPage);
     download = await waitForExportRecordDownload(records.owner, records.frame, exportedAt, {
       label: config.name,
@@ -1126,14 +1872,21 @@ if (require.main === module) {
 module.exports = {
   REPORTS,
   clearOtherCheckedSubjectOptions,
+  clickConfiguredExport,
   downloadGenericReport,
   ensureCheckboxOption,
+  installClientExportTrace,
+  isExcelResponseDiagnostic,
+  isWorkbookBuffer,
   isFreshExportRecord,
   isFreshProductRecord,
+  openFilterSelect,
   openReportFromMenuSearch,
   recordTimestamp,
+  retryTracedBlobDownload,
   selectedReportKinds,
   selectSingleOption,
+  saveResponseWorkbook,
   trackingRequiresPlatformSales,
   userActionRequiredEvent,
   verifyCheckboxOptions,
