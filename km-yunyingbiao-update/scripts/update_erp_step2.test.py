@@ -12,6 +12,7 @@ from update_erp_step2 import (
     append_tracking_skus,
     headers,
     platform_sales_eligible_rows,
+    prepare_tracking_data,
 )
 
 
@@ -44,6 +45,7 @@ def main():
         }
         for index in range(1, 4)
     ])
+    tracking.loc[0, "SKU"] = "EXISTING-SKU"
     appended, _ = append_tracking_skus(
         workbook, sheet, columns, tracking, legacy_name=None
     )
@@ -56,6 +58,17 @@ def main():
     ]
     assert platform_sales_eligible_rows(sheet, columns) == [3, 4, 5, 6]
 
+    raw_tracking = pd.DataFrame([
+        {"平台SKU": "KEEP-BLANK-GROUP", "SKU": "SKU-1", "主体": "KM一部一组", "小组": "", "预计开售时间": "2026/10", "新品期截止月": "2026/12", "预测销量完成比例": "10%"},
+        {"平台SKU": "KEEP-BLANK-GROUP", "SKU": "SKU-2", "主体": "KM一部一组", "小组": "", "预计开售时间": "2026/11", "新品期截止月": "2027/01", "预测销量完成比例": "20%"},
+        {"平台SKU": "", "SKU": "SKU-3", "主体": "KM一部三组", "小组": "", "预计开售时间": "2026/12", "新品期截止月": "2027/02", "预测销量完成比例": "0%"},
+        {"平台SKU": "DROP-OTHER-SUBJECT", "SKU": "SKU-4", "主体": "其他主体", "小组": "KM一部一组", "预计开售时间": "2026/12", "新品期截止月": "2027/02", "预测销量完成比例": "0%"},
+    ])
+    prepared = prepare_tracking_data(raw_tracking)
+    assert len(raw_tracking) == 4
+    assert list(prepared["平台SKU"]) == ["KEEP-BLANK-GROUP"]
+    assert prepared.iloc[0]["SKU"] == "SKU-1"
+
     for row in (3, 4, 5, 6):
         sheet.cell(row, columns["店铺别名"]).value = "KM-US"
     assert platform_sales_eligible_rows(sheet, columns) == []
@@ -64,7 +77,7 @@ def main():
     sheet.cell(6, columns["主体"]).value = "KM一部一组"
     assert platform_sales_eligible_rows(sheet, columns) == []
     workbook.close()
-    print("Step2 legacy-condition regression test passed.")
+    print("Step2 source-preservation and legacy-condition regression test passed.")
 
 
 if __name__ == "__main__":

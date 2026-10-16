@@ -345,6 +345,36 @@ async function waitForTrackingFrame(page, timeoutMs = 60000) {
   return null;
 }
 
+async function trackingResultSnapshot(frame) {
+  const loading = await frame.locator(
+    '.el-loading-mask:visible, .ant-spin-spinning:visible, [class*="loading"]:visible, [class*="Loading"]:visible',
+  ).count().catch(() => 0);
+  const rows = await frame.locator('tbody tr:visible').count().catch(() => 0);
+  const table = await firstVisible(frame.locator('table'));
+  const preview = table
+    ? (await table.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 1000)
+    : '';
+  return { loading, rows, preview };
+}
+
+async function waitForTrackingResultsSettled(frame, before, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  let last = null;
+  let stablePasses = 0;
+  while (Date.now() < deadline) {
+    await frame.waitForTimeout(500);
+    const current = await trackingResultSnapshot(frame);
+    const signature = JSON.stringify({ rows: current.rows, preview: current.preview });
+    const changed = current.rows !== before.rows || current.preview !== before.preview;
+    if (current.loading === 0 && signature === last) stablePasses += 1;
+    else stablePasses = 0;
+    last = signature;
+    if (stablePasses >= 2 && (changed || Date.now() - startedAt >= 5000)) return current;
+  }
+  throw new Error('点击“搜索”后，列表在 30 秒内未达到稳定状态，已停止导出以避免下载旧数据。');
+}
+
 async function frameContaining(page, requiredTexts, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1261,8 +1291,19 @@ async function openReportAndApplyKnownFilters(page, config, kind) {
 
     const search = await firstVisible(frame.getByText('搜索', { exact: true }));
     if (!search) throw new Error('筛选完成，但未找到“搜索”按钮。');
+    const beforeSearch = await trackingResultSnapshot(frame);
+    const responsePromise = page.waitForResponse((response) => {
+      const resourceType = response.request().resourceType();
+      return ['xhr', 'fetch'].includes(resourceType) && response.status() < 500;
+    }, { timeout: 15000 }).catch(() => null);
     await search.click({ noWaitAfter: true });
-    await page.waitForTimeout(2500);
+    const searchResponse = await responsePromise;
+    const settled = await waitForTrackingResultsSettled(frame, beforeSearch);
+    console.log(JSON.stringify({
+      stage: 'tracking-search-settled',
+      response: searchResponse ? responseDiagnostic(searchResponse) : null,
+      visibleRows: settled.rows,
+    }, null, 2));
     done.push('搜索');
   } else if (kind === 'products') {
     if (await clickTextAnyFrame(page, 'Kemimoto')) done.push('Kemimoto');
@@ -2007,6 +2048,8 @@ module.exports = {
   selectSingleOption,
   saveResponseWorkbook,
   trackingRequiresPlatformSales,
+  trackingResultSnapshot,
   userActionRequiredEvent,
   verifyCheckboxOptions,
+  waitForTrackingResultsSettled,
 };

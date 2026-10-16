@@ -110,7 +110,10 @@ python "$skillRoot\scripts\add_product_archive_sheet.py" `
 
 ## 8. Source tabs and repeated runs
 
-- Add one source tab for the filtered新品成功率 export and one for the complete产品档案 export.
+- Add complete source tabs for every downloaded ERP export. Preserve every exported row, column, value, and original order in `ERP新品成功率`, `ERP产品档案`, `Step2平台SKU映射`, and `Step2亚马逊销售面板`.
+- Filtering, field selection, and deduplication apply only to separate in-memory matching copies. Never use a processed matching frame as the source tab.
+- For新品成功率 matching, validate exact `主体` values and deduplicate the matching copy by `平台SKU`. Do not discard a valid row merely because its `小组` field is blank.
+- Treat `平台SKU` as the sole uniqueness key when appending. The same `仓库SKU` may legitimately have more than one distinct platform SKU.
 - On a repeated run, replace the prior generated tab with the same logical name rather than creating `产品档案1`, `产品档案2`, or equivalent duplicates.
 - Keep the original downloaded files in the runtime staging directory for traceability; do not place business exports under version control.
 

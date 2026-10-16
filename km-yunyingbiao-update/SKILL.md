@@ -17,6 +17,7 @@ Run either step independently when explicitly requested. For a complete refresh,
 - Never overwrite any input workbook. Always write a new `.xlsx`.
 - `产品表-老三(含清货淘汰)` or `产品表-老三（含清货淘汰）` is mandatory and must remain semantically identical: values, formulas, styles, dimensions, merged cells, hidden state and filters.
 - Preserve every unrelated worksheet and field. Do not use the old Step2 behavior that deletes non-`产品表` sheets.
+- Every downloaded ERP workbook must be embedded as a complete source tab with all exported rows and columns in original order. Never write a filtered, deduplicated, or field-trimmed DataFrame into a source tab. Create a separate in-memory copy for matching, filtering, and deduplication.
 - ERP and BI login is completed by the user. Never store, infer, reveal, autofill, or reuse credentials.
 - Use only `KM一部一组`, `KM一部二组`, and `KM一部三组` source rows.
 - Keep all downloads and generated business workbooks in a runtime staging directory outside this Skill repository.
@@ -54,13 +55,15 @@ Step1 may be run independently against an approved workbook whose product rows a
 
 1. Record a new `run_start` before opening ERP.
 2. Use one command for the complete ERP step: `node "$skillRoot\scripts\erp_playwright_download.js" --kind step2-all --workbook "C:\path\work-step1.xlsx" --download-dir "C:\path\fresh-run-downloads"`.
-3. The user completes DingTalk QR login once. In the same browser context, the script always downloads 新品成功率跟踪表 and 产品档案. It filters the tracking report to brand `Kemimoto` and the exact three KM groups, filters 产品档案 to `Kemimoto`, and follows only current-run asynchronous export-record rows.
+3. The user completes DingTalk QR login once. In the same browser context, the script always downloads 新品成功率跟踪表 and 产品档案. It filters the tracking report to brand `Kemimoto` and the exact three KM groups, filters 产品档案 to `Kemimoto`, and follows only current-run asynchronous export-record rows. After clicking tracking `搜索`, wait for the query response and a stable result table before exporting; a fixed delay alone is not sufficient.
 4. Keep `tracking`, `products`, `tracking-products`, `platform`, and `sales` modes only for explicitly requested isolated tests or refreshes. Do not combine separate commands during a complete Step2 run because each command creates a new login session.
 5. Preserve the original Step2 condition exactly; this is not a new rule. After applying the established 2026+ append rule in memory, rows need platform mapping only when both `平台SKU` and `仓库SKU` are present and all four fields `店铺别名/主体/运营/备货状态` are blank. If no row meets that old condition, skip both platform/sales downloads and leave their fields and source tabs unchanged. If any row meets it, automatically download both fresh sources in the same login session.
 6. Use a new empty download directory for every run. The platform and sales downloads use fixed filenames and refuse to overwrite an existing file.
 7. Run `scripts/validate_erp_step2_exports.py` with the downloaded paths and `--fresh-after <run_start>` before changing the operations workbook. Omit both `--platform` and `--sales` only when the preflight explicitly skipped them.
 8. Run `scripts/update_erp_step2.py` with the validated ERP exports. Omit both platform/sales arguments only when the old Step2 condition found zero eligible rows. The processor independently checks the same condition and fails instead of silently skipping a required mapping update.
 9. Run `scripts/verify_product_archive_output.py` and review the JSON summary before accepting the Step2 output.
+
+The tracking matching copy uses exact `主体` values, ignores blank platform-SKU keys, and deduplicates only by `平台SKU`. The complete unmodified export remains in `ERP新品成功率`. New operation rows are also unique only by `平台SKU`; an existing warehouse SKU must not suppress a distinct new platform SKU.
 
 ```powershell
 python "$skillRoot\scripts\validate_erp_step2_exports.py" `
