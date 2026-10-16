@@ -63,6 +63,15 @@ def represented_groups(series):
     return {group for group in ALLOWED_GROUPS if any(group in value for value in raw)}
 
 
+def canonical_subject(value):
+    text = clean(value)
+    for subject in ALLOWED_GROUPS:
+        pattern = rf"(?<![\u4e00-\u9fffA-Za-z0-9]){re.escape(subject)}(?![\u4e00-\u9fffA-Za-z0-9])"
+        if re.search(pattern, text):
+            return subject
+    return ""
+
+
 def validate_tracking(path):
     required = ["平台SKU", "SKU", "预计开售时间", "新品期截止月", "预测销量完成比例", "公司品牌", "主体", "小组"]
     frame, sheet, header = read_table(path, required)
@@ -92,10 +101,12 @@ def validate_products(path):
 def validate_platform(path):
     required = ["主体", "平台SKU", "系统SKU", "店铺别名", "运营", "备货状态", "小组"]
     frame, sheet, header = read_table(path, required, sheet_name="平台SKU映射&备货")
-    groups = values(frame, "小组")
-    allowed_rows = frame[target_group_mask(frame["小组"])]
-    require(len(allowed_rows) > 0, "平台 SKU 映射没有三个目标小组的数据。")
-    return {"sheet": sheet, "headerRow": header + 1, "rows": len(frame), "targetGroupRows": len(allowed_rows), "groups": sorted(groups)}
+    canonical = frame["主体"].map(canonical_subject)
+    invalid = sorted({clean(value) for value in frame.loc[canonical == "", "主体"] if clean(value)})
+    require(not invalid, f"平台 SKU 映射包含目标范围外主体：{invalid[:20]}")
+    subjects = {value for value in canonical if value}
+    require(bool(subjects), "平台 SKU 映射没有三个指定主体的数据。")
+    return {"sheet": sheet, "headerRow": header + 1, "rows": len(frame), "subjects": sorted(subjects), "strictSubjects": True}
 
 
 def validate_sales(path):

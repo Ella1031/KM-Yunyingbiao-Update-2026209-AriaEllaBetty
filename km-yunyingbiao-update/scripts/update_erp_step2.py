@@ -50,6 +50,15 @@ def group_mask(series):
     return series.astype(str).str.contains("|".join(ALLOWED_GROUPS), regex=True, na=False)
 
 
+def canonical_subject(value):
+    text = clean(value)
+    for subject in ALLOWED_GROUPS:
+        pattern = rf"(?<![\u4e00-\u9fffA-Za-z0-9]){re.escape(subject)}(?![\u4e00-\u9fffA-Za-z0-9])"
+        if re.search(pattern, text):
+            return subject
+    return ""
+
+
 def subject_mask(series):
     return series.astype(str).str.strip().isin(ALLOWED_GROUPS)
 
@@ -219,7 +228,12 @@ def site_rank(alias):
 def load_platform(path):
     source = pd.read_excel(path, sheet_name="平台SKU映射&备货", header=1, dtype=str).fillna("")
     require({normalized(c): c for c in source.columns}, ["主体", "平台SKU", "系统SKU", "店铺别名", "运营", "备货状态", "小组"], "平台SKU映射")
-    return source, source[group_mask(source["小组"])].copy()
+    canonical = source["主体"].map(canonical_subject)
+    outside = source.loc[canonical == "", "主体"].map(clean)
+    outside = sorted({value for value in outside if value})
+    if outside:
+        raise ValueError(f"平台SKU映射包含目标范围外主体: {', '.join(outside[:20])}")
+    return source, source.copy()
 
 
 def load_sales(path):

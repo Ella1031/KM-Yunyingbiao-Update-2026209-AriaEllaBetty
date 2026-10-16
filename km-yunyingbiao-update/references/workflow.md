@@ -45,6 +45,7 @@ Run this export only when the original Step2 condition reports one or more rows 
 3. In `主体`, select exactly `KM一部一组`, `KM一部二组`, and `KM一部三组`, then verify all three checkbox states.
 4. Click `搜索`.
 5. Click `导出 -> 导出（运营）`. If the current ERP page shows a confirmation dialog, click its `确认` or `确定` button. The page submits `exportExcelByOperationType`; keep the same report and authenticated browser session open for up to ten minutes while the server builds the direct response. Capture the resulting direct download as `映射-备货信息-运营.xlsx`. Do not switch to `常用操作 -> 导出记录` for this report.
+6. Verify the exported `主体` column. Retain the untouched ERP response as `映射-备货信息-运营-原始导出.xlsx`, then create the runtime source `映射-备货信息-运营.xlsx` by keeping every column and every row whose `主体` resolves to one of the three exact allowed names. ERP may decorate the value as `KM一部一组【KM一部一组】`; extract only the exact canonical name and reject numeric aliases or longer names. Embed only this strict three-subject source in `Step2平台SKU映射`; do not embed the full-company export.
 
 ## 5. Export亚马逊销售面板
 
@@ -110,7 +111,7 @@ python "$skillRoot\scripts\add_product_archive_sheet.py" `
 
 ## 8. Source tabs and repeated runs
 
-- Add complete source tabs for every downloaded ERP export. Preserve every exported row, column, value, and original order in `ERP新品成功率`, `ERP产品档案`, `Step2平台SKU映射`, and `Step2亚马逊销售面板`.
+- Add complete source tabs for every downloaded ERP export. Preserve every exported row, column, value, and original order in `ERP新品成功率`, `ERP产品档案`, and `Step2亚马逊销售面板`. For `Step2平台SKU映射`, preserve every row, column, value, and original order after the mandatory exact `主体` scope restriction.
 - Filtering, field selection, and deduplication apply only to separate in-memory matching copies. Never use a processed matching frame as the source tab.
 - For新品成功率 matching, validate exact `主体` values and deduplicate the matching copy by `平台SKU`. Do not discard a valid row merely because its `小组` field is blank.
 - Treat `平台SKU` as the sole uniqueness key when appending. The same `仓库SKU` may legitimately have more than one distinct platform SKU.
@@ -152,6 +153,6 @@ Run once without `--output` first to validate freshness, exact filters, required
 
 This workflow can be automated after the user completes QR login. Run `scripts/erp_playwright_download.js --kind step2-all --workbook <current-operations-workbook> --download-dir <new-empty-directory>` once. The script uses the fixed menu paths for `我的平台SKU` and `Amazon销售面板` only when the original Step2 condition requires those sources. It waits for the current `我的平台SKU` direct-download request and follows only a current-run export-record row for `Amazon销售面板`. It saves those reports as `映射-备货信息-运营.xlsx` and `亚马逊销售面板.xlsx`.
 
-Before running the workbook processor, execute `scripts/validate_erp_step2_exports.py` with all four export paths and the recorded `run_start`. The validator rejects stale files, wrong tracking brand or subjects, missing source sheets, and missing required fields. Platform and sales exports may contain other groups because the processor filters their `小组` column to the three exact KM groups.
+Before running the workbook processor, execute `scripts/validate_erp_step2_exports.py` with all four export paths and the recorded `run_start`. The validator rejects stale files, wrong tracking brand or subjects, missing source sheets, and missing required fields. The platform export must contain no主体 outside the three exact KM names. The sales export may contain decorated group labels, but its matching copy is restricted to the three exact KM group names.
 
 Fully unattended execution is not appropriate because DingTalk scanning is a user-authentication step and Chrome may require a user-visible download permission confirmation.

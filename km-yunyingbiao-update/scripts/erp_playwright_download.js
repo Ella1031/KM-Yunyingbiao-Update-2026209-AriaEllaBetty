@@ -41,6 +41,7 @@ const REPORTS = {
     nestedExport: true,
     recordTerms: ['replenishmentInfo', '导出备货信息', '映射-备货信息-运营'],
     outputName: '映射-备货信息-运营.xlsx',
+    rawOutputName: '映射-备货信息-运营-原始导出.xlsx',
     pageTerms: ['主体', '搜索', '导出'],
   },
   sales: {
@@ -1779,7 +1780,12 @@ async function applyGenericGroupFilter(surface, config) {
   const searchFrames = [frame, ...surface.owner.frames().filter((item) => item !== frame)];
   const search = await visibleNormalizedAction(searchFrames, ['搜索', '查询']);
   if (!search) throw new Error(`${config.name} 筛选完成，但未找到“搜索/查询”按钮。`);
+  const searchResponsePromise = surface.owner.waitForResponse((response) => {
+    const resourceType = response.request().resourceType();
+    return ['xhr', 'fetch'].includes(resourceType) && response.status() < 500;
+  }, { timeout: 15000 }).catch(() => null);
   await search.locator.click({ noWaitAfter: true }).catch(() => search.locator.evaluate((node) => node.click()));
+  const searchResponse = await searchResponsePromise;
   await frame.waitForTimeout(2500);
   console.log(JSON.stringify({
     stage: 'filters',
@@ -1787,11 +1793,49 @@ async function applyGenericGroupFilter(surface, config) {
     reset: Boolean(reset),
     field: config.filterLabel,
     groups: requiredGroups.map((group) => group.name),
+    searchResponse: searchResponse ? responseDiagnostic(searchResponse) : null,
   }, null, 2));
+}
+
+function strictFilterPlatformExport(rawPath, outputDir) {
+  const bundledPython = process.env.USERPROFILE
+    ? path.join(
+      process.env.USERPROFILE,
+      '.cache',
+      'codex-runtimes',
+      'codex-primary-runtime',
+      'dependencies',
+      'python',
+      'python.exe',
+    )
+    : null;
+  const python = process.env.PYTHON_EXECUTABLE
+    || (bundledPython && fs.existsSync(bundledPython) ? bundledPython : 'python');
+  const outputPath = path.join(outputDir, REPORTS.platform.outputName);
+  const script = path.join(__dirname, 'filter_platform_export.py');
+  const result = spawnSync(python, [
+    script,
+    '--input', rawPath,
+    '--output', outputPath,
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`平台 SKU 严格主体过滤失败：${result.error?.message || result.stderr || result.stdout}`);
+  }
+  const summary = JSON.parse(result.stdout);
+  console.log(JSON.stringify({ stage: 'platform-strict-filtered', ...summary }, null, 2));
+  return outputPath;
+}
+
+function finalizeGenericDownload(kind, rawPath, outputDir) {
+  return kind === 'platform' ? strictFilterPlatformExport(rawPath, outputDir) : rawPath;
 }
 
 async function downloadGenericReport(context, shellPage, outputDir, kind) {
   const config = REPORTS[kind];
+  const savedOutputName = config.rawOutputName || config.outputName;
   let surface = await openConfiguredReport(shellPage, config);
   await applyGenericGroupFilter(surface, config);
   surface = await activateConfiguredReportTab(shellPage, config);
@@ -1843,11 +1887,12 @@ async function downloadGenericReport(context, shellPage, outputDir, kind) {
       if (result && result.body) {
         responseMonitor.stop();
         console.log(JSON.stringify({ stage: 'export-response-workbook', kind, ...result.diagnostic }, null, 2));
-        return saveResponseWorkbook(result.body, outputDir, exportedAt, kind, config.outputName);
+        const rawPath = saveResponseWorkbook(result.body, outputDir, exportedAt, kind, savedOutputName);
+        return finalizeGenericDownload(kind, rawPath, outputDir);
       }
       download = result;
       if (!download) {
-        const retried = await retryTracedBlobDownload(surface.frame, surface.owner, config.outputName);
+        const retried = await retryTracedBlobDownload(surface.frame, surface.owner, savedOutputName);
         download = retried.download;
         console.log(JSON.stringify({ stage: 'client-export-trace', kind, retried: Boolean(download), ...retried.trace }, null, 2));
       }
@@ -1861,7 +1906,8 @@ async function downloadGenericReport(context, shellPage, outputDir, kind) {
       if (result && result.body) {
         responseMonitor.stop();
         console.log(JSON.stringify({ stage: 'export-response-workbook', kind, ...result.diagnostic }, null, 2));
-        return saveResponseWorkbook(result.body, outputDir, exportedAt, kind, config.outputName);
+        const rawPath = saveResponseWorkbook(result.body, outputDir, exportedAt, kind, savedOutputName);
+        return finalizeGenericDownload(kind, rawPath, outputDir);
       }
       download = result;
     }
@@ -1887,7 +1933,8 @@ async function downloadGenericReport(context, shellPage, outputDir, kind) {
     });
   }
   console.log(JSON.stringify({ stage: 'export-submitted', kind, action }, null, 2));
-  return saveDownload(download, outputDir, exportedAt, kind, config.outputName);
+  const rawPath = await saveDownload(download, outputDir, exportedAt, kind, savedOutputName);
+  return finalizeGenericDownload(kind, rawPath, outputDir);
 }
 
 async function downloadTracking(context, outputDir) {
