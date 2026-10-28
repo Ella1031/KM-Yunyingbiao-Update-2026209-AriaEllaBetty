@@ -35,17 +35,17 @@ def fresh_file(path, fresh_after):
 
 
 def read_table(path, required_columns, sheet_name=None, header_candidates=range(0, 6)):
-    workbook = pd.ExcelFile(path)
-    sheets = [sheet_name] if sheet_name else workbook.sheet_names
-    require(all(sheet in workbook.sheet_names for sheet in sheets), f"{path.name} 缺少工作表：{sheet_name}")
-    required = {normalized(name) for name in required_columns}
-    for sheet in sheets:
-        for header in header_candidates:
-            preview = pd.read_excel(path, sheet_name=sheet, header=header, nrows=0)
-            columns = {normalized(column): column for column in preview.columns}
-            if required.issubset(columns):
-                frame = pd.read_excel(path, sheet_name=sheet, header=header, dtype=str).fillna("")
-                return frame.rename(columns={columns[name]: name for name in required}), sheet, header
+    with pd.ExcelFile(path) as workbook:
+        sheets = [sheet_name] if sheet_name else workbook.sheet_names
+        require(all(sheet in workbook.sheet_names for sheet in sheets), f"{path.name} 缺少工作表：{sheet_name}")
+        required = {normalized(name) for name in required_columns}
+        for sheet in sheets:
+            for header in header_candidates:
+                preview = pd.read_excel(workbook, sheet_name=sheet, header=header, nrows=0)
+                columns = {normalized(column): column for column in preview.columns}
+                if required.issubset(columns):
+                    frame = pd.read_excel(workbook, sheet_name=sheet, header=header, dtype=str).fillna("")
+                    return frame.rename(columns={columns[name]: name for name in required}), sheet, header
     raise ValueError(f"{path.name} 未找到必需字段：{', '.join(required_columns)}")
 
 
@@ -63,6 +63,13 @@ def represented_groups(series):
     return {group for group in ALLOWED_GROUPS if any(group in value for value in raw)}
 
 
+def require_all_groups(series, label):
+    represented = represented_groups(series)
+    missing = sorted(ALLOWED_GROUPS - represented)
+    require(not missing, f"{label}缺少目标小组：{missing}")
+    return represented
+
+
 def canonical_subject(value):
     text = clean(value)
     for subject in ALLOWED_GROUPS:
@@ -78,10 +85,9 @@ def validate_tracking(path):
     brands = values(frame, "公司品牌")
     subjects = values(frame, "主体")
     groups = values(frame, "小组")
-    represented = represented_groups(frame["小组"])
+    represented = require_all_groups(frame["小组"], "新品成功率")
     require(brands == {"Kemimoto"}, f"新品成功率品牌不纯：{sorted(brands)}")
     require(subjects == ALLOWED_GROUPS, f"新品成功率主体必须精确为三个 KM 组：{sorted(subjects)}")
-    require(represented == ALLOWED_GROUPS, f"新品成功率小组未覆盖三个 KM 组：{sorted(groups)}")
     nonblank_groups = frame["小组"].map(clean) != ""
     require(target_group_mask(frame.loc[nonblank_groups, "小组"]).all(), f"新品成功率包含目标范围外的小组：{sorted(groups)}")
     return {"sheet": sheet, "headerRow": header + 1, "rows": len(frame), "brands": sorted(brands), "subjects": sorted(subjects), "groups": sorted(groups)}
@@ -105,7 +111,8 @@ def validate_platform(path):
     invalid = sorted({clean(value) for value in frame.loc[canonical == "", "主体"] if clean(value)})
     require(not invalid, f"平台 SKU 映射包含目标范围外主体：{invalid[:20]}")
     subjects = {value for value in canonical if value}
-    require(bool(subjects), "平台 SKU 映射没有三个指定主体的数据。")
+    missing = sorted(ALLOWED_GROUPS - subjects)
+    require(not missing, f"平台 SKU 映射缺少目标主体：{missing}")
     return {"sheet": sheet, "headerRow": header + 1, "rows": len(frame), "subjects": sorted(subjects), "strictSubjects": True}
 
 
@@ -113,9 +120,21 @@ def validate_sales(path):
     required = ["店铺", "MSKU", "ASIN", "小组"] + [f"标签{i:02d}" for i in range(1, 11)]
     frame, sheet, header = read_table(path, required, sheet_name="MSKU销售面板")
     groups = values(frame, "小组")
+    represented = require_all_groups(frame["小组"], "亚马逊销售面板")
+    nonblank_groups = frame["小组"].map(clean) != ""
+    require(
+        target_group_mask(frame.loc[nonblank_groups, "小组"]).all(),
+        f"亚马逊销售面板包含目标范围外的小组：{sorted(groups)}",
+    )
     allowed_rows = frame[target_group_mask(frame["小组"])]
-    require(len(allowed_rows) > 0, "亚马逊销售面板没有三个目标小组的数据。")
-    return {"sheet": sheet, "headerRow": header + 1, "rows": len(frame), "targetGroupRows": len(allowed_rows), "groups": sorted(groups)}
+    return {
+        "sheet": sheet,
+        "headerRow": header + 1,
+        "rows": len(frame),
+        "targetGroupRows": len(allowed_rows),
+        "groups": sorted(groups),
+        "representedGroups": sorted(represented),
+    }
 
 
 def parser():

@@ -61,11 +61,12 @@ def main():
     raw_tracking = pd.DataFrame([
         {"平台SKU": "KEEP-BLANK-GROUP", "SKU": "SKU-1", "主体": "KM一部一组", "小组": "", "预计开售时间": "2026/10", "新品期截止月": "2026/12", "预测销量完成比例": "10%"},
         {"平台SKU": "KEEP-BLANK-GROUP", "SKU": "SKU-2", "主体": "KM一部一组", "小组": "", "预计开售时间": "2026/11", "新品期截止月": "2027/01", "预测销量完成比例": "20%"},
+        {"平台SKU": "", "SKU": "SKU-2B", "主体": "KM一部二组", "小组": "", "预计开售时间": "2026/11", "新品期截止月": "2027/01", "预测销量完成比例": "20%"},
         {"平台SKU": "", "SKU": "SKU-3", "主体": "KM一部三组", "小组": "", "预计开售时间": "2026/12", "新品期截止月": "2027/02", "预测销量完成比例": "0%"},
         {"平台SKU": "DROP-OTHER-SUBJECT", "SKU": "SKU-4", "主体": "其他主体", "小组": "KM一部一组", "预计开售时间": "2026/12", "新品期截止月": "2027/02", "预测销量完成比例": "0%"},
     ])
     prepared = prepare_tracking_data(raw_tracking)
-    assert len(raw_tracking) == 4
+    assert len(raw_tracking) == 5
     assert list(prepared["平台SKU"]) == ["KEEP-BLANK-GROUP"]
     assert prepared.iloc[0]["SKU"] == "SKU-1"
 

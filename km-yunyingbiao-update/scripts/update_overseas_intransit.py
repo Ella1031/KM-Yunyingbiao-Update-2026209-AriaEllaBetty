@@ -453,14 +453,20 @@ def prepare_bi_sheet(parts: dict[str, bytes]) -> tuple[ET.Element, dict[str, dic
             raise AssertionError(f"BI source cell changed unexpectedly: {original_ref}")
 
     unexpected_subjects = set()
+    represented_subjects = set()
     for row_number, row in rows.items():
         if row_number < 3:
             continue
         value = cell_text(row_cells(row).get(3), strings).strip()
+        if value in ALLOWED_SUBJECTS:
+            represented_subjects.add(value)
         if value and value not in ALLOWED_SUBJECTS:
             unexpected_subjects.add(value)
     if unexpected_subjects:
         raise ValueError("BI export contains unapproved 主体 values: " + ", ".join(sorted(unexpected_subjects)))
+    missing_subjects = sorted(ALLOWED_SUBJECTS - represented_subjects)
+    if missing_subjects:
+        raise ValueError("BI export is missing required 主体 values: " + ", ".join(missing_subjects))
 
     header = row_cells(rows[1])
     date_columns = {}

@@ -50,6 +50,19 @@ def group_mask(series):
     return series.astype(str).str.contains("|".join(ALLOWED_GROUPS), regex=True, na=False)
 
 
+def represented_groups(series):
+    values = {clean(value) for value in series if clean(value)}
+    return {group for group in ALLOWED_GROUPS if any(group in value for value in values)}
+
+
+def require_all_groups(series, label):
+    represented = represented_groups(series)
+    missing = sorted(set(ALLOWED_GROUPS) - represented)
+    if missing:
+        raise ValueError(f"{label}缺少目标小组: {', '.join(missing)}")
+    return represented
+
+
 def canonical_subject(value):
     text = clean(value)
     for subject in ALLOWED_GROUPS:
@@ -70,6 +83,10 @@ def prepare_tracking_data(source):
         ["平台SKU", "SKU", "主体", "预计开售时间", "新品期截止月", "预测销量完成比例"],
         "ERP新品成功率",
     )
+    subjects = {clean(value) for value in source["主体"] if clean(value)}
+    missing = sorted(set(ALLOWED_GROUPS) - subjects)
+    if missing:
+        raise ValueError(f"ERP新品成功率缺少目标主体: {', '.join(missing)}")
     matching = source[subject_mask(source["主体"])].copy()
     matching = matching[matching["平台SKU"].astype(str).str.strip() != ""]
     return matching.drop_duplicates("平台SKU", keep="first")
@@ -233,6 +250,10 @@ def load_platform(path):
     outside = sorted({value for value in outside if value})
     if outside:
         raise ValueError(f"平台SKU映射包含目标范围外主体: {', '.join(outside[:20])}")
+    subjects = {value for value in canonical if value}
+    missing = sorted(set(ALLOWED_GROUPS) - subjects)
+    if missing:
+        raise ValueError(f"平台SKU映射缺少目标主体: {', '.join(missing)}")
     return source, source.copy()
 
 
@@ -240,6 +261,11 @@ def load_sales(path):
     columns = ["店铺", "MSKU", "ASIN", "小组"] + [f"标签{i:02d}" for i in range(1, 11)]
     source = pd.read_excel(path, sheet_name="MSKU销售面板", dtype=str).fillna("")
     require({normalized(c): c for c in source.columns}, columns, "亚马逊销售面板")
+    require_all_groups(source["小组"], "亚马逊销售面板")
+    outside = source.loc[~group_mask(source["小组"]), "小组"].map(clean)
+    outside = sorted({value for value in outside if value})
+    if outside:
+        raise ValueError(f"亚马逊销售面板包含目标范围外小组: {', '.join(outside[:20])}")
     matching = source.loc[group_mask(source["小组"]), columns].copy()
     return source, matching
 

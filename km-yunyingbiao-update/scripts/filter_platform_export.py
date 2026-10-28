@@ -54,8 +54,9 @@ def main():
     canonical = source[subject_column].map(canonical_subject)
     filtered = source.loc[canonical != ""].copy()
     subjects = sorted({value for value in canonical if value})
-    if filtered.empty:
-        raise ValueError("平台 SKU 原始导出没有三个指定主体的数据")
+    missing = sorted(ALLOWED_SUBJECTS - set(subjects))
+    if missing:
+        raise ValueError(f"平台 SKU 原始导出缺少目标主体：{missing}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
         first_row.to_excel(writer, sheet_name=SHEET_NAME, header=False, index=False)

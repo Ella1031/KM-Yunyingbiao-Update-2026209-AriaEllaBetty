@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const { loadPlaywright } = require('./playwright_runtime');
+const runState = require('./run_state');
 const { chromium } = loadPlaywright();
 
 const BI_URL = 'https://dms.issyzone.net:38999/webroot/decision#/';
@@ -353,7 +354,18 @@ async function runAuthenticatedContext(context, outputDir, runStartedAt) {
 
 async function main() {
   const outputDir = path.resolve(arg('download-dir', path.join(process.cwd(), 'downloads')));
+  const stateFile = arg('state-file', null);
   fs.mkdirSync(outputDir, { recursive: true });
+  if (stateFile) {
+    const existingState = runState.loadState(path.resolve(stateFile));
+    if (runState.sourceReusable(existingState, 'bi')) {
+      console.log(JSON.stringify({
+        stage: 'reused', kind: 'bi', path: existingState.sources.bi.path,
+        reason: 'validated-source-fingerprint-matched',
+      }, null, 2));
+      return;
+    }
+  }
   const executablePath = chromePath();
   if (!executablePath) throw new Error('未找到 Chrome/Edge。请设置 PLAYWRIGHT_CHROME_PATH。');
 
@@ -363,7 +375,11 @@ async function main() {
   });
   const context = await activeBrowser.newContext({ acceptDownloads: true });
   const page = await context.newPage();
-  const runStartedAt = Date.now();
+  const requestedRunStart = Date.now() / 1000;
+  const runStartedAtSeconds = stateFile
+    ? runState.beginDomain(path.resolve(stateFile), 'bi', requestedRunStart)
+    : requestedRunStart;
+  const runStartedAt = runStartedAtSeconds * 1000;
   await page.goto(arg('url', BI_URL), { waitUntil: 'domcontentloaded', timeout: 60000 });
   console.log(JSON.stringify({ stage: 'opened', url: page.url(), title: await page.title(), runStartedAt }, null, 2));
   console.log(JSON.stringify(userActionRequiredEvent(), null, 2));
@@ -371,7 +387,14 @@ async function main() {
   if (!await waitForAuthenticated(context)) throw new Error('等待 BI 登录超过 5 分钟。');
   console.log(JSON.stringify({ stage: 'authenticated', url: page.url() }, null, 2));
 
-  await runAuthenticatedContext(context, outputDir, runStartedAt);
+  const downloadedPath = await runAuthenticatedContext(context, outputDir, runStartedAt);
+  if (stateFile) {
+    runState.recordSource(
+      path.resolve(stateFile), 'bi', 'bi', downloadedPath, runStartedAtSeconds,
+      { report: REPORT_NAME },
+    );
+    runState.completeDownloadStage(path.resolve(stateFile), 'bi', ['bi']);
+  }
   await activeBrowser.close();
   activeBrowser = null;
 }

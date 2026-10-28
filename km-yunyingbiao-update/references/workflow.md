@@ -4,6 +4,8 @@ This reference documents the ERP portion of the original two-step workflow. BI o
 
 ## 1. ERP登录与人工 handoff
 
+Before opening ERP, read the shared `run-state.json`. If the required ERP exports are already marked `validated` and their fingerprints still match, skip login and continue from processing or verification. A resumed run retains the original ERP `run_start`; do not record a later timestamp for the same files. Pass `--state-file` to the downloader so each successful export is recorded immediately.
+
 Open `https://erp.issyzone.net:9999/system/index`. If a DingTalk QR login is shown, stop before login and ask the user to scan. Never use saved credentials or attempt to bypass the scan. The Playwright runner checks the login state every two seconds and resumes automatically when the ERP shell is available; do not require the user to press Enter after scanning.
 Every refresh run must use a new user-authenticated session and newly generated exports. Do not reuse an older export when the user requested the latest data.
 Record `run_start` before opening ERP. The ERP processor must receive `--fresh-after run_start` and reject any tracking, product, platform, or sales export whose filesystem timestamp is older than that value.
@@ -156,3 +158,5 @@ This workflow can be automated after the user completes QR login. Run `scripts/e
 Before running the workbook processor, execute `scripts/validate_erp_step2_exports.py` with all four export paths and the recorded `run_start`. The validator rejects stale files, wrong tracking brand or subjects, missing source sheets, and missing required fields. The platform export must contain no主体 outside the three exact KM names. The sales export may contain decorated group labels, but its matching copy is restricted to the three exact KM group names.
 
 Fully unattended execution is not appropriate because DingTalk scanning is a user-authentication step and Chrome may require a user-visible download permission confirmation.
+
+Processing or validation failure does not invalidate a successful download. Keep the run directory, source exports, `stages/erp-step2.xlsx`, and `run-state.json`. Reopen ERP only when a required ERP source is missing, changed, corrupt, or fails the ERP business validator.

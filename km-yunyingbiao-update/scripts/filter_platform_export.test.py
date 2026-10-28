@@ -43,6 +43,26 @@ def main():
             ("KM一部二组【KM一部二组】", "C", "SKU-C"),
             ("KM一部三组【KM一部三组】", "D", "SKU-D"),
         ]
+
+        incomplete = root / "incomplete.xlsx"
+        incomplete_output = root / "incomplete-filtered.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "平台SKU映射&备货"
+        sheet.append(["导出说明", None, None])
+        sheet.append(["主体", "平台SKU", "系统SKU"])
+        sheet.append(["KM一部一组", "A", "SKU-A"])
+        sheet.append(["KM一部二组", "B", "SKU-B"])
+        workbook.save(incomplete)
+        failed = subprocess.run([
+            sys.executable,
+            str(Path(__file__).with_name("filter_platform_export.py")),
+            "--input", str(incomplete),
+            "--output", str(incomplete_output),
+        ], capture_output=True, text=True)
+        assert failed.returncode != 0
+        assert "KM一部三组" in failed.stderr
+        assert not incomplete_output.exists()
     print("Platform export strict-subject filter test passed.")
 
 

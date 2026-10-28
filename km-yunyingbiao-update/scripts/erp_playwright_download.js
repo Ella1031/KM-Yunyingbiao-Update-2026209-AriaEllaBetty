@@ -8,6 +8,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 const { loadPlaywright } = require('./playwright_runtime');
+const runState = require('./run_state');
 const { chromium } = loadPlaywright();
 let filterControlSequence = 0;
 
@@ -800,6 +801,37 @@ async function selectedControlTexts(combobox) {
     .filter(Boolean);
 }
 
+function committedSelectionCoverage(selectedTexts, requiredOptions) {
+  const options = normalizeRequiredOptions(requiredOptions);
+  const represented = options.filter((option) => option.aliases.some((alias) => (
+    selectedTexts.some((text) => optionTextMatchesAlias(text, alias))
+  )));
+  return {
+    selectedTexts,
+    representedNames: represented.map((option) => option.name),
+    missingNames: options
+      .filter((option) => !represented.includes(option))
+      .map((option) => option.name),
+    unexpectedTexts: selectedTexts.filter((text) => !options.some((option) => (
+      option.aliases.some((alias) => optionTextMatchesAlias(text, alias))
+    ))),
+  };
+}
+
+async function verifyCommittedSelections(combobox, requiredOptions) {
+  const coverage = committedSelectionCoverage(
+    await selectedControlTexts(combobox),
+    requiredOptions,
+  );
+  if (coverage.missingNames.length || coverage.unexpectedTexts.length) {
+    const details = [];
+    if (coverage.missingNames.length) details.push(`缺少：${coverage.missingNames.join('、')}`);
+    if (coverage.unexpectedTexts.length) details.push(`额外：${coverage.unexpectedTexts.join('、')}`);
+    throw new Error(`筛选框实际已选值未严格覆盖三个 KM 组（${details.join('；')}）`);
+  }
+  return coverage;
+}
+
 async function selectionStateDiagnostic(frame, combobox) {
   const root = await selectionControlRoot(combobox);
   const controlled = await controlledPopup(frame, combobox);
@@ -1142,7 +1174,7 @@ async function ensureCheckboxOption(frame, aliases, combobox = null) {
   throw new Error(`主体选项未能勾选：${aliases[0]}`);
 }
 
-async function verifyCheckboxOptions(frame, requiredOptions, combobox = null) {
+async function verifyCheckboxOptions(frame, requiredOptions, combobox = null, settings = {}) {
   const options = normalizeRequiredOptions(requiredOptions);
   const missing = [];
   for (const option of options) {
@@ -1160,6 +1192,45 @@ async function verifyCheckboxOptions(frame, requiredOptions, combobox = null) {
     }, null, 2));
     throw new Error(`主体最终校验未通过，未选中：${missing.join(', ')}`);
   }
+  if (settings.requireCommitted) {
+    return verifyCommittedSelections(combobox, requiredOptions);
+  }
+  return {
+    selectedTexts: await selectedControlTexts(combobox),
+    representedNames: normalizeRequiredOptions(requiredOptions).map((option) => option.name),
+    missingNames: [],
+    unexpectedTexts: [],
+  };
+}
+
+async function ensureCommittedCheckboxOptions(frame, requiredOptions, combobox) {
+  const options = normalizeRequiredOptions(requiredOptions);
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await clearOtherCheckedSubjectOptions(frame, options, combobox);
+    for (const option of options) await ensureCheckboxOption(frame, option.aliases, combobox);
+    await clearOtherCheckedSubjectOptions(frame, options, combobox);
+    try {
+      return await verifyCheckboxOptions(frame, options, combobox, { requireCommitted: true });
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) break;
+      const coverage = committedSelectionCoverage(await selectedControlTexts(combobox), options);
+      for (const missingName of coverage.missingNames) {
+        const option = options.find((candidate) => candidate.name === missingName);
+        await ensureComboboxOpen(combobox);
+        const found = await findCheckboxOptionWithScroll(frame, option.aliases, combobox);
+        if (found && await optionChecked(found.option)) {
+          await found.option.click({ force: true, noWaitAfter: true }).catch(() => (
+            found.option.evaluate((node) => node.click())
+          ));
+          await frame.waitForTimeout(250);
+        }
+        await ensureCheckboxOption(frame, option.aliases, combobox);
+      }
+    }
+  }
+  throw lastError || new Error('筛选框未能提交三个 KM 组。');
 }
 
 async function clearOtherCheckedSubjectOptions(frame, allowedNames, combobox) {
@@ -1406,6 +1477,7 @@ function createExportResponseMonitor(context, owners, startedAt) {
   const workbookPromise = new Promise((resolve) => { resolveWorkbook = resolve; });
   let workbookResolved = false;
   let exportRequestLogged = false;
+  let platformExportRequest = null;
   const listeners = [];
 
   const requestListener = (request) => {
@@ -1415,6 +1487,7 @@ function createExportResponseMonitor(context, owners, startedAt) {
     diagnostics.requests.push(diagnostic);
     if (diagnostics.requests.length > 100) diagnostics.requests.shift();
     if (!exportRequestLogged && diagnostic.url.includes('/exportExcelByOperationType')) {
+      platformExportRequest = request;
       exportRequestLogged = true;
       console.log(JSON.stringify({ stage: 'platform-export-request-started', ...diagnostic }, null, 2));
     }
@@ -1461,6 +1534,34 @@ function createExportResponseMonitor(context, owners, startedAt) {
   return {
     diagnostics,
     workbookPromise,
+    async replayWorkbook() {
+      if (!platformExportRequest) return null;
+      const headers = { ...platformExportRequest.headers() };
+      delete headers.host;
+      delete headers['content-length'];
+      const replay = await context.request.fetch(platformExportRequest.url(), {
+        method: platformExportRequest.method(),
+        headers,
+        data: platformExportRequest.postData() || undefined,
+        failOnStatusCode: false,
+        timeout: 600000,
+      }).catch(() => null);
+      if (!replay) return null;
+      const replayHeaders = replay.headers();
+      const diagnostic = {
+        method: platformExportRequest.method(),
+        resourceType: 'api-request-replay',
+        status: replay.status(),
+        url: replay.url(),
+        contentType: replayHeaders['content-type'] || '',
+        contentDisposition: replayHeaders['content-disposition'] || '',
+        contentLength: replayHeaders['content-length'] || '',
+      };
+      diagnostics.responses.push(diagnostic);
+      const body = await replay.body().catch(() => null);
+      if (!isWorkbookBuffer(body)) return null;
+      return { body, diagnostic };
+    },
     stop() {
       for (const { owner, event, listener } of listeners) owner.off(event, listener);
       if (!workbookResolved) resolveWorkbook(null);
@@ -1771,11 +1872,14 @@ async function applyGenericGroupFilter(surface, config) {
   await ensureComboboxOpen(groupSelect);
   await frame.waitForTimeout(300);
   const requiredGroups = REQUIRED_KM_GROUPS;
-  await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
-  for (const group of requiredGroups) await ensureCheckboxOption(frame, group.aliases, groupSelect);
-  await clearOtherCheckedSubjectOptions(frame, requiredGroups, groupSelect);
-  await verifyCheckboxOptions(frame, requiredGroups, groupSelect);
+  let committed = await ensureCommittedCheckboxOptions(frame, requiredGroups, groupSelect);
   await surface.owner.keyboard.press('Escape').catch(() => {});
+  committed = await verifyCheckboxOptions(
+    frame,
+    requiredGroups,
+    groupSelect,
+    { requireCommitted: true },
+  );
 
   const searchFrames = [frame, ...surface.owner.frames().filter((item) => item !== frame)];
   const search = await visibleNormalizedAction(searchFrames, ['搜索', '查询']);
@@ -1787,12 +1891,19 @@ async function applyGenericGroupFilter(surface, config) {
   await search.locator.click({ noWaitAfter: true }).catch(() => search.locator.evaluate((node) => node.click()));
   const searchResponse = await searchResponsePromise;
   await frame.waitForTimeout(2500);
+  committed = await verifyCheckboxOptions(
+    frame,
+    requiredGroups,
+    groupSelect,
+    { requireCommitted: true },
+  );
   console.log(JSON.stringify({
     stage: 'filters',
     kind: config.name,
     reset: Boolean(reset),
     field: config.filterLabel,
-    groups: requiredGroups.map((group) => group.name),
+    groups: committed.representedNames,
+    selectedTexts: committed.selectedTexts,
     searchResponse: searchResponse ? responseDiagnostic(searchResponse) : null,
   }, null, 2));
 }
@@ -1892,6 +2003,13 @@ async function downloadGenericReport(context, shellPage, outputDir, kind) {
       }
       download = result;
       if (!download) {
+        const replayed = await responseMonitor.replayWorkbook();
+        if (replayed) {
+          responseMonitor.stop();
+          console.log(JSON.stringify({ stage: 'export-response-replayed', kind, ...replayed.diagnostic }, null, 2));
+          const rawPath = saveResponseWorkbook(replayed.body, outputDir, exportedAt, kind, savedOutputName);
+          return finalizeGenericDownload(kind, rawPath, outputDir);
+        }
         const retried = await retryTracedBlobDownload(surface.frame, surface.owner, savedOutputName);
         download = retried.download;
         console.log(JSON.stringify({ stage: 'client-export-trace', kind, retried: Boolean(download), ...retried.trace }, null, 2));
@@ -1910,6 +2028,15 @@ async function downloadGenericReport(context, shellPage, outputDir, kind) {
         return finalizeGenericDownload(kind, rawPath, outputDir);
       }
       download = result;
+      if (!download) {
+        const replayed = await responseMonitor.replayWorkbook();
+        if (replayed) {
+          responseMonitor.stop();
+          console.log(JSON.stringify({ stage: 'export-response-replayed', kind, ...replayed.diagnostic }, null, 2));
+          const rawPath = saveResponseWorkbook(replayed.body, outputDir, exportedAt, kind, savedOutputName);
+          return finalizeGenericDownload(kind, rawPath, outputDir);
+        }
+      }
     }
   }
   if (download) responseMonitor.stop();
@@ -2024,12 +2151,33 @@ function trackingRequiresPlatformSales(workbook, tracking, freshAfter) {
 
 async function main() {
   const requestedKind = arg('kind', 'tracking');
-  const kinds = selectedReportKinds(requestedKind);
+  let kinds = selectedReportKinds(requestedKind);
   const outputDir = path.resolve(arg('download-dir', path.join(process.cwd(), 'downloads')));
   const workbook = arg('workbook', null);
-  const freshAfter = Date.now() / 1000;
+  const stateFile = arg('state-file', null);
+  const requestedFreshAfter = Date.now() / 1000;
+  const freshAfter = stateFile
+    ? runState.beginDomain(path.resolve(stateFile), 'erp', requestedFreshAfter)
+    : requestedFreshAfter;
   if (requestedKind === 'step2-all' && !workbook) {
     throw new Error('--kind step2-all 必须提供 --workbook，才能沿用旧 Step2 条件判断是否下载平台映射和销售面板。');
+  }
+  let existingState = null;
+  let savedPlatformSalesDecision = null;
+  if (stateFile) {
+    existingState = runState.loadState(path.resolve(stateFile));
+    savedPlatformSalesDecision = existingState.stages?.erp_download?.result?.platformSalesDecision || null;
+    kinds = kinds.filter((kind) => !runState.sourceReusable(existingState, kind));
+    if (savedPlatformSalesDecision && !savedPlatformSalesDecision.required) {
+      kinds = kinds.filter((kind) => !['platform', 'sales'].includes(kind));
+    }
+    if (!kinds.length) {
+      console.log(JSON.stringify({
+        stage: 'reused', kind: requestedKind,
+        reason: 'validated-source-fingerprints-matched',
+      }, null, 2));
+      return;
+    }
   }
   fs.mkdirSync(outputDir, { recursive: true });
   const executablePath = chromePath();
@@ -2045,11 +2193,17 @@ async function main() {
   if (!await waitForAuthenticated(shellPage)) throw new Error('等待钉钉登录超过 5 分钟，未继续执行。');
   console.log(JSON.stringify({ stage: 'authenticated', url: shellPage.url() }, null, 2));
 
-  let trackingPath = null;
-  let platformSalesDecision = null;
+  let trackingPath = existingState && runState.sourceReusable(existingState, 'tracking')
+    ? existingState.sources.tracking.path
+    : null;
+  const downloaded = {};
+  let platformSalesDecision = savedPlatformSalesDecision;
   for (const kind of kinds) {
-    if (kind === 'tracking') trackingPath = await downloadTracking(context, outputDir);
-    if (kind === 'products') await downloadProducts(context, shellPage, outputDir);
+    if (kind === 'tracking') {
+      trackingPath = await downloadTracking(context, outputDir);
+      downloaded.tracking = trackingPath;
+    }
+    if (kind === 'products') downloaded.products = await downloadProducts(context, shellPage, outputDir);
     if (kind === 'platform' || kind === 'sales') {
       if (workbook && trackingPath && platformSalesDecision == null) {
         platformSalesDecision = trackingRequiresPlatformSales(path.resolve(workbook), trackingPath, freshAfter);
@@ -2063,8 +2217,19 @@ async function main() {
         }, null, 2));
         continue;
       }
-      await downloadGenericReport(context, shellPage, outputDir, kind);
+      downloaded[kind] = await downloadGenericReport(context, shellPage, outputDir, kind);
     }
+  }
+  if (stateFile) {
+    const resolvedState = path.resolve(stateFile);
+    for (const [name, filePath] of Object.entries(downloaded)) {
+      runState.recordSource(resolvedState, 'erp', name, filePath, freshAfter, { reportKind: name });
+    }
+    const completedNames = ['tracking', 'products'];
+    if (!platformSalesDecision || platformSalesDecision.required) completedNames.push('platform', 'sales');
+    runState.completeDownloadStage(resolvedState, 'erp', completedNames, {
+      platformSalesDecision,
+    });
   }
   await browser.close();
 }
@@ -2079,9 +2244,11 @@ if (require.main === module) {
 module.exports = {
   REPORTS,
   clearOtherCheckedSubjectOptions,
+  committedSelectionCoverage,
   clickConfiguredExport,
   downloadGenericReport,
   ensureCheckboxOption,
+  ensureCommittedCheckboxOptions,
   installClientExportTrace,
   isExcelResponseDiagnostic,
   isWorkbookBuffer,
@@ -2098,5 +2265,6 @@ module.exports = {
   trackingResultSnapshot,
   userActionRequiredEvent,
   verifyCheckboxOptions,
+  verifyCommittedSelections,
   waitForTrackingResultsSettled,
 };

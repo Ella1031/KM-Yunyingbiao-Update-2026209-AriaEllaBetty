@@ -2,6 +2,8 @@
 
 ## 1. 登录和访问边界
 
+Before opening BI, read the shared `run-state.json`. If the BI export is already marked `validated` and its fingerprint still matches, skip BI login and reuse it. A resumed run retains the original BI `run_start`; do not make a validated export stale by recording a new timestamp. Pass `--state-file` to the downloader so the successful export is recorded immediately.
+
 Open `https://dms.issyzone.net:38999/webroot/decision#/`.
 
 - The user must personally enter the BI username and password.
@@ -115,3 +117,5 @@ Before accepting the output, verify:
 - no credentials, downloaded workbook, or generated business-data workbook is added to the Skill repository.
 
 Run `scripts/verify_overseas_output.py` against the Step2 input, cleaned BI file, and Step3 output. It independently verifies the single-sheet cleanup, exact subjects, inserted platform-SKU column, blank-only writes, and unchanged unrelated package parts.
+
+If processing or this verifier fails, preserve the downloaded BI file, cleaned BI file, final candidate, and run state. Retry only the failed processing or verification stage. Reopen BI only when the recorded source is missing, changed, corrupt, or fails BI validation.

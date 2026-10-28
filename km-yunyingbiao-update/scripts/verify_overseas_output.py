@@ -122,6 +122,15 @@ def verify(input_path: Path, cleaned_bi_path: Path, output_path: Path) -> dict:
         "xl/styles.xml",
         source_product_part,
     }
+    source_bi_matches = [
+        item[2]
+        for item in step3.workbook_sheets(source_parts)[2]
+        if item[0] == step3.TARGET_SHEET_NAME
+    ]
+    if len(source_bi_matches) > 1:
+        raise AssertionError("Input contains duplicate horizontal BI worksheets")
+    if source_bi_matches:
+        allowed_parts.add(source_bi_matches[0])
     unrelated_changes = [
         name for name, data in source_parts.items()
         if name not in allowed_parts and output_parts.get(name) != data

@@ -10,6 +10,7 @@ const {
   REPORTS,
   clearOtherCheckedSubjectOptions,
   clickConfiguredExport,
+  committedSelectionCoverage,
   downloadGenericReport,
   ensureCheckboxOption,
   installClientExportTrace,
@@ -26,6 +27,7 @@ const {
   saveResponseWorkbook,
   userActionRequiredEvent,
   verifyCheckboxOptions,
+  verifyCommittedSelections,
 } = require('./erp_playwright_download');
 
 function chromePath() {
@@ -71,6 +73,17 @@ async function main() {
     { name: 'KM一部二组', aliases: ['KM一部二组'] },
     { name: 'KM一部三组', aliases: ['KM一部三组'] },
   ];
+  assert.deepStrictEqual(
+    committedSelectionCoverage(
+      ['DP000422【KM一部一组】', 'KM一部二组', 'KM一部三组'],
+      required,
+    ).missingNames,
+    [],
+  );
+  assert.deepStrictEqual(
+    committedSelectionCoverage(['KM一部二组', 'KM一部三组'], required).missingNames,
+    ['KM一部一组'],
+  );
   await clearOtherCheckedSubjectOptions(page.mainFrame(), required, subject);
   for (const option of required) await ensureCheckboxOption(page.mainFrame(), option.aliases, subject);
   await clearOtherCheckedSubjectOptions(page.mainFrame(), required, subject);
@@ -283,11 +296,30 @@ async function main() {
     <section id="sales-report" hidden>
       <h1>亚马逊销售面板</h1>
       <button>重置</button>
-      <input placeholder="小组" role="combobox" aria-controls="sales-groups" aria-expanded="true">
+      <div class="el-select">
+        <div class="el-select__tags">
+          ${canonicalRequired.map((name) => `<span class="el-tag">${name}</span>`).join('')}
+        </div>
+        <input placeholder="小组" role="combobox" aria-controls="sales-groups" aria-expanded="true">
+      </div>
       <div id="sales-groups" class="el-popper">
-        <label class="el-checkbox"><input type="checkbox"><span>KM一部一组</span></label>
-        <label class="el-checkbox"><input type="checkbox"><span>KM一部二组</span></label>
-        <label class="el-checkbox"><input type="checkbox"><span>KM一部三组</span></label>
+        ${canonicalRequired.map((name) => `
+          <label class="el-checkbox is-checked" onclick="
+            event.preventDefault();
+            const input=this.querySelector('input');
+            input.checked=!input.checked;
+            this.classList.toggle('is-checked', input.checked);
+            const existing=document.querySelector('[data-sales-group=\"${name}\"]');
+            if (existing) existing.remove();
+            if (input.checked) {
+              const tag=document.createElement('span');
+              tag.className='el-tag';
+              tag.dataset.salesGroup='${name}';
+              tag.textContent='${name}';
+              document.querySelector('.el-select__tags').appendChild(tag);
+            }
+          "><input type="checkbox" checked><span>${name}</span></label>
+        `).join('')}
       </div>
       <input type="button" value="搜索">
       <a download="raw-sales.xlsx" href="data:application/octet-stream;base64,dGVzdCB3b3JrYm9vaw==">导出Excel</a>
@@ -308,6 +340,20 @@ async function main() {
     REPORTS.sales.exportTexts = salesExportTexts;
     fs.rmSync(downloadDir, { recursive: true, force: true });
   }
+
+  await page.setContent(`
+    <div class="el-select">
+      <div class="el-select__tags">
+        <span class="el-tag">KM一部二组</span>
+        <span class="el-tag">KM一部三组</span>
+      </div>
+      <input id="incomplete-groups" role="combobox" aria-expanded="false">
+    </div>
+  `);
+  await assert.rejects(
+    verifyCommittedSelections(page.locator('#incomplete-groups'), required),
+    /缺少：KM一部一组/,
+  );
 
   assert.strictEqual(isExcelResponseDiagnostic({
     contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
